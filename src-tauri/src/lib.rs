@@ -7,6 +7,7 @@ mod process_guard;
 mod rpc_data;
 
 use tauri::Manager;
+use tauri::window::Color;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -21,6 +22,9 @@ pub fn run() {
             let _ = commands::get_hidden_hwid();
 
             if let Some(window) = app.get_webview_window("main") {
+                // Force WebView2 background to #09090b before any content loads
+                let _ = window.set_background_color(Some(Color(9, 9, 11, 255)));
+
                 let icon_bytes = include_bytes!("../icons/icon.png");
                 let icon = tauri::image::Image::from_bytes(icon_bytes)
                     .expect("failed to load icon");
@@ -37,6 +41,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::show_window,
             commands::fetch_url,
             commands::fetch_server_list,
             commands::ping_server,

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useLauncherStore } from "@/stores/launcherStore";
 import { Rocket } from "lucide-react";
 
@@ -10,6 +11,7 @@ export function SplashScreen() {
   const [status, setStatus] = useState("Initializing...");
 
   useEffect(() => {
+    invoke("show_window").catch(() => {});
     const steps = [
       { msg: "Loading configuration...", duration: 400 },
       { msg: "Checking for updates...", duration: 600 },

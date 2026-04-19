@@ -36,6 +36,9 @@ export default function RootLayout({
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
       style={{ backgroundColor: "#09090b" }}
     >
+      <head>
+        <style dangerouslySetInnerHTML={{ __html: "html,body{background:#09090b!important}" }} />
+      </head>
       <body className="h-screen flex overflow-hidden" style={{ backgroundColor: "#09090b" }}>{children}</body>
     </html>
   );

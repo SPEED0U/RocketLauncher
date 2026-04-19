@@ -13,6 +13,14 @@ use tokio::sync::Mutex;
 static HWID: OnceLock<String> = OnceLock::new();
 static HIDDEN_HWID: OnceLock<String> = OnceLock::new();
 
+#[command]
+pub fn show_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn generate_hwid() -> String {
     use sysinfo::System;
     
@@ -110,8 +118,10 @@ pub async fn fetch_url(
     body: Option<String>,
     content_type: Option<String>,
 ) -> Result<FetchResponse, String> {
+    let ua = "GameLauncherReborn 2.2.4 (+https://github.com/SPEED0U/RocketLauncher)";
+    let x_ua = "GameLauncherReborn 2.2.4";
     let client = reqwest::Client::builder()
-        .user_agent("RocketLauncher") // UA used for dev.
+        .user_agent(ua)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
@@ -126,8 +136,8 @@ pub async fn fetch_url(
         _ => client.get(&url),
     };
 
-    request = request.header("X-UserAgent", "RocketLauncher");
-    request = request.header("X-GameLauncherHash", "2E6A98E2B98D21417D2030F96C9A9BA453518993");
+    request = request.header("X-UserAgent", x_ua);
+    request = request.header("X-GameLauncherHash", "1DF8911B158CD1DF88BF95AE21ABA20AA84B4AE6");
     request = request.header("X-HWID", get_hwid());
     request = request.header("X-HiddenHWID", get_hidden_hwid());
     request = request.header("X-GameLauncherCertificate", "");
@@ -150,8 +160,9 @@ pub async fn fetch_url(
 
 #[command]
 pub async fn fetch_server_list(api_url: String) -> Result<String, String> {
+    let ua = "GameLauncherReborn 2.2.4 (+https://github.com/SPEED0U/RocketLauncher)";
     let client = reqwest::Client::builder()
-        .user_agent("rocketlauncher/1.1.6")
+        .user_agent(ua)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| e.to_string())?;
