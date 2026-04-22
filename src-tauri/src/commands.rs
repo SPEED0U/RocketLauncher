@@ -511,7 +511,9 @@ pub async fn launch_game(
 
     #[cfg(not(windows))]
     let child_plain = Some(
-        std::process::Command::new(&exe_path)
+        std::process::Command::new("wine")
+            .env("WINEDLLOVERRIDES", "dinput8=n,b")
+            .arg(&exe_path)
             .current_dir(game_dir)
             .arg(server_id.to_uppercase())
             .arg(&effective_ip)
@@ -826,6 +828,8 @@ pub fn grant_folder_permissions(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
+
+    #[cfg(target_os = "windows")]
     let output = std::process::Command::new("icacls")
         .arg(&path)
         .arg("/grant")
@@ -833,9 +837,9 @@ pub fn grant_folder_permissions(path: String) -> Result<(), String> {
         .arg("/T")
         .arg("/Q")
         .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("Failed to run icacls: {}", e))?;
+        .output();
 
+    #[cfg(target_os = "windows")]
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("icacls failed: {}", stderr));
