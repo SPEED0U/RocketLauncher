@@ -5,7 +5,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useLauncherStore } from "@/stores/launcherStore";
 import { getSystemInfo, getHwidInfo } from "@/lib/tauri-api";
-import { APP_VERSION } from "@/lib/config";
+import { APP_VERSION, getAppVersion } from "@/lib/config";
 import { Copy, Check, Monitor, Settings2, Server, Cpu, Fingerprint } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import type { SystemInfo } from "@/lib/tauri-api";
@@ -56,15 +56,29 @@ export function DebugScreen() {
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null);
   const [hwid, setHwid] = useState("Loading...");
   const [hiddenHwid, setHiddenHwid] = useState("Loading...");
+  const [version, setVersion] = useState("APP_VERSION");
 
   useEffect(() => {
     getSystemInfo().then(setSysInfo).catch(() => setSysInfo(null));
     getHwidInfo()
       .then(([h, hh]) => { setHwid(h); setHiddenHwid(hh); })
       .catch(() => { setHwid("N/A"); setHiddenHwid("N/A"); });
+    getAppVersion().then(setVersion).catch(() => setVersion(APP_VERSION));
   }, []);
 
   const fmtBytes = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+
+  // Function to extract CPU model from full brand string
+  const extractCPUModel = (brand: string) => {
+    if (!brand) return "Unknown";
+    
+    brand = brand.replace(/(AMD\s+)/, 'AMD ');
+    brand = brand.replace(/(Intel\(R\) Core\(TM\)\s*)/, 'Intel® Core™ ');
+    brand = brand.replace(/CPU\s+@\s+\d+(\.\d+)?[GM]Hz/i, '');
+    brand = brand.trim();
+    
+    return brand || "Unknown";
+  };
 
   function copyDebugInfo() {
     const lines = [
@@ -73,7 +87,7 @@ export function DebugScreen() {
       `Hostname: ${sysInfo?.hostname ?? "Unknown"}`,
       `Screen Resolution: ${window.screen.width}x${window.screen.height}`,
       "",
-      `Launcher Version: ${APP_VERSION}`,
+      `Launcher Version: ${version}`,
       `Language: ${navigator.language || "en-US"}`,
       `Install Directory: ${settings.installationDirectory || "Not Set"}`,
       `Credentials Saved: ${userEmail ? "Yes" : "No"}`,
@@ -86,7 +100,7 @@ export function DebugScreen() {
       `CDN Address: ${settings.selectedCDN ?? "N/A"}`,
       `Client Method: HTTP`,
       "",
-      `CPU: ${sysInfo?.cpu_brand ?? "Unknown"}`,
+      `CPU: ${sysInfo?.cpu_brand ? extractCPUModel(sysInfo.cpu_brand) : "Unknown"}`,
       `CPU Cores: ${sysInfo?.cpu_cores?.toString() ?? "Unknown"}`,
       `RAM: ${sysInfo ? `${fmtBytes(sysInfo.total_memory)} (${fmtBytes(sysInfo.used_memory)} used)` : "Unknown"}`,
       `GPU: ${sysInfo?.gpu_name ?? "Unknown"}`,
@@ -129,7 +143,7 @@ export function DebugScreen() {
           </Section>
 
           <Section icon={<Settings2 size={15} />} title="Launcher" description="Configuration and state">
-            <InfoRow label="Version" value={APP_VERSION} />
+            <InfoRow label="Version" value={version} />
             <InfoRow label="Language" value={navigator.language || "en-US"} />
             <InfoRow label="Install Directory" value={settings.installationDirectory || "Not Set"} />
             <InfoRow label="Credentials Saved" value={userEmail ? "Yes" : "No"} />
@@ -146,7 +160,7 @@ export function DebugScreen() {
           </Section>
 
           <Section icon={<Cpu size={15} />} title="Hardware" description="CPU, GPU and storage">
-            <InfoRow label="CPU" value={sysInfo?.cpu_brand ?? "..."} />
+            <InfoRow label="CPU" value={sysInfo?.cpu_brand ? extractCPUModel(sysInfo.cpu_brand) : "..."} />
             <InfoRow label="CPU Cores" value={sysInfo?.cpu_cores?.toString() ?? "..."} />
             <InfoRow label="RAM" value={sysInfo ? `${fmtBytes(sysInfo.total_memory)} (${fmtBytes(sysInfo.used_memory)} used)` : "..."} />
             <InfoRow label="GPU" value={sysInfo?.gpu_name ?? "..."} />

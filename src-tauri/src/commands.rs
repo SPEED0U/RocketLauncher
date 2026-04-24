@@ -837,7 +837,8 @@ pub fn grant_folder_permissions(path: String) -> Result<(), String> {
         .arg("/T")
         .arg("/Q")
         .creation_flags(0x08000000)
-        .output();
+        .output()
+        .map_err(|e| format!("Failed to run icacls: {}", e))?;
 
     #[cfg(target_os = "windows")]
     if !output.status.success() {

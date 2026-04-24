@@ -19,11 +19,24 @@ import { useDiscordRPC } from "@/lib/useDiscordRPC";
 import { cleanMods } from "@/lib/tauri-api";
 
 function ContentPanel() {
-  const { currentPage } = useLauncherStore();
+  const { currentPage, setPage } = useLauncherStore();
   const [displayedPage, setDisplayedPage] = useState(currentPage);
   const [transitionClass, setTransitionClass] = useState("animate-fade-in");
+  const [isWindows, setIsWindows] = useState(true);
 
   useEffect(() => {
+    import("@/lib/tauri-api")
+      .then(({ getSystemInfo }) => getSystemInfo())
+      .then((sysInfo) => {
+        const isWin = sysInfo.os_name.toLowerCase().includes("windows");
+        setIsWindows(isWin);
+        // Redirect to main if trying to access security on non-Windows
+        if (!isWin && currentPage === "security") {
+          setPage("main");
+        }
+      })
+      .catch(() => setIsWindows(true));
+
     if (currentPage !== displayedPage) {
       setTransitionClass("animate-fade-out");
       const timer = setTimeout(() => {
@@ -39,7 +52,7 @@ function ContentPanel() {
       case "settings":
         return <SettingsScreen />;
       case "security":
-        return <SecurityScreen />;
+        return isWindows ? <SecurityScreen /> : <MainScreen />;
       case "verify":
         return <VerifyScreen />;
       case "debug":

@@ -63,6 +63,7 @@ export function TopBar() {
   const [showDebug, setShowDebug] = useState(
     process.env.NODE_ENV === "development"
   );
+  const [navActions, setNavActions] = useState(baseNavActions);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -79,7 +80,20 @@ export function TopBar() {
     import("@tauri-apps/api/app")
       .then(({ getVersion }) => getVersion())
       .then(setAppVersion)
-      .catch(() => setAppVersion("1.0.0"));
+      .catch(() => setAppVersion("Loading..."));
+  }, []);
+
+  useEffect(() => {
+    import("@/lib/tauri-api")
+      .then(({ getSystemInfo }) => getSystemInfo())
+      .then((sysInfo) => {
+        const isWindows = sysInfo.os_name.toLowerCase().includes("windows");
+        // Filter out security for non-Windows users
+        setNavActions(isWindows ? baseNavActions : baseNavActions.filter((a) => a.page !== "security"));
+      })
+      .catch(() => {
+        setNavActions(baseNavActions);
+      });
   }, []);
 
   return (
@@ -108,7 +122,7 @@ export function TopBar() {
         </button>
         <div className="w-px h-5 bg-border/50 mx-1" />
         <nav className="flex items-center gap-0.5">
-          {baseNavActions.map((item) => (
+          {navActions.map((item) => (
             <Tooltip key={item.page} label={item.tooltip}>
               <button
                 onClick={() =>
