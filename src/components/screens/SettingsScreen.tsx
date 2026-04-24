@@ -18,6 +18,7 @@ import {
   Sliders,
   Cpu,
   ImageOff,
+  Layers,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { pickGameFolder, validateGameFolder, fetchCDNListRaw, verifyGameFiles, repairGameFiles, getGameLanguage, setGameLanguage } from "@/lib/tauri-api";
@@ -92,6 +93,9 @@ export function SettingsScreen() {
   const [dxvkVersion, setDxvkVersion] = useState<string | null>(null);
   const [dxvkLoading, setDxvkLoading] = useState(false);
   const [dxvkError, setDxvkError] = useState("");
+  const [isWindows, setIsWindows] = useState<boolean | null>(null);
+  const [systemLoaded, setSystemLoaded] = useState(false);
+  const [homeDir, setHomeDir] = useState<string>("");
   const unlistenRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
@@ -101,6 +105,24 @@ export function SettingsScreen() {
         setSettings({ language: lang });
       }
     }).catch(() => {});
+
+    (async () => {
+      try {
+        const { getSystemInfo } = await import("@/lib/tauri-api");
+        const { homeDir } = await import("@tauri-apps/api/path");
+        const sysInfo = await getSystemInfo();
+        const home = await homeDir();
+        
+        const isWindows = sysInfo.os_name.toLowerCase().includes("windows");
+        setIsWindows(isWindows);
+        setHomeDir(home);
+        setSystemLoaded(true);
+      } catch {
+        setIsWindows(false);
+        setHomeDir("");
+        setSystemLoaded(true);
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -246,6 +268,13 @@ export function SettingsScreen() {
 
   return (
     <div className="flex-1 relative flex items-center justify-center p-4 overflow-hidden">
+      {!systemLoaded ? (
+        <div className="flex flex-col items-center justify-center gap-3">
+          <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-xs text-muted">Loading system info...</p>
+        </div>
+      ) : (
+      <>
       <div className="absolute top-4 left-4 right-4 flex items-center justify-between">
         <h1 className="text-base font-bold">Settings</h1>
         <div className="flex items-center gap-2">
@@ -283,7 +312,7 @@ export function SettingsScreen() {
                       setSettings({ installationDirectory: val });
                     }
                   }}
-                  placeholder="C:\Games\NFSW"
+                  placeholder={isWindows ? "C:\\Games\\NFSW" : `${homeDir}/Games/NFSW`}
                   className="flex-1 rounded-lg border border-border bg-background/50 px-3 py-1.5 text-xs text-foreground placeholder:text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
                 />
                 <Button variant="secondary" size="sm" onClick={handlePickFolder} disabled={isAutoVerifying} className="h-7 px-2.5">
@@ -492,7 +521,7 @@ export function SettingsScreen() {
                     { value: "ES", label: "Español" },
                     { value: "FR", label: "Français" },
                     { value: "PL", label: "Polski" },
-                    { value: "PT", label: "Português (Brasil)" },
+                    { value: "PT", label: "Português" },
                     { value: "RU", label: "Русский" },
                     { value: "TC", label: "繁體中文" },
                     { value: "SC", label: "简体中文" },
@@ -501,47 +530,72 @@ export function SettingsScreen() {
                   ]}
                 />
               </div>
-              <div className="flex items-center justify-between py-3">
-                <div className="flex items-center gap-3">
-                  <span className={dxvkInstalled ? "text-success" : "text-muted"}>
-                    <Cpu size={13} />
-                  </span>
-                  <div>
-                    <div className="flex items-center gap-1.5">
-                      <p className="text-sm font-medium">DXVK</p>
-                      {dxvkInstalled && (
-                        <span className="text-[9px] font-mono text-muted">v{dxvkVersion ?? "2.4"}</span>
-                      )}
+              {isWindows && (
+                <>
+                  <div className="flex items-center justify-between py-3">
+                    <div className="flex items-center gap-3">
+                      <span className={dxvkInstalled ? "text-success" : "text-muted"}>
+                        <Cpu size={13} />
+                      </span>
+                      <div>
+                        <div className="flex items-center gap-1.5">
+                          <p className="text-sm font-medium">DXVK</p>
+                          {dxvkInstalled && (
+                            <span className="text-[9px] font-mono text-muted">v{dxvkVersion ?? "2.4"}</span>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted mt-0.5">
+                          {dxvkInstalled ? "DX9 → Vulkan active" : "DX9 → Vulkan translation"}
+                        </p>
+                      </div>
                     </div>
-                    <p className="text-xs text-muted mt-0.5">
-                      {dxvkInstalled ? "DX9 → Vulkan active" : "DX9 → Vulkan translation"}
+                    {dxvkInstalled ? (
+                      <Button variant="ghost" size="sm" onClick={handleRemoveDxvk} isLoading={dxvkLoading}
+                        disabled={dxvkLoading || !settings.installationDirectory}
+                        className="h-7 px-2.5 text-[11px] text-danger hover:bg-danger/10">
+                        Remove
+                      </Button>
+                    ) : (
+                      <Button variant="secondary" size="sm" onClick={handleInstallDxvk} isLoading={dxvkLoading}
+                        disabled={dxvkLoading || !settings.installationDirectory || folderStatus === "cloud"}
+                        className="h-7 px-2.5 text-[11px]">
+                        {dxvkLoading ? "Installing..." : "Install"}
+                      </Button>
+                    )}
+                  </div>
+
+                  {dxvkError && (
+                    <p className="text-[10px] text-danger flex items-center gap-1 py-2">
+                      <AlertTriangle size={10} /> {dxvkError}
                     </p>
+                  )}
+                  {folderStatus === "cloud" && (
+                    <p className="text-[10px] text-danger flex items-center gap-1 py-2">
+                      <AlertTriangle size={10} /> DXVK cannot be installed in a cloud storage folder
+                    </p>
+                  )}
+                </>
+              )}
+
+              {isWindows == false && (
+                            <div className="flex items-center justify-between py-3">
+                <div className="flex items-center gap-3">
+                  <span className="text-muted"><Layers size={13} /></span>
+                  <div>
+                    <p className="text-sm font-medium">Windows Layer</p>
+                    <p className="text-xs text-muted mt-0.5">Game compatibility environment</p>
                   </div>
                 </div>
-                {dxvkInstalled ? (
-                  <Button variant="ghost" size="sm" onClick={handleRemoveDxvk} isLoading={dxvkLoading}
-                    disabled={dxvkLoading || !settings.installationDirectory}
-                    className="h-7 px-2.5 text-[11px] text-danger hover:bg-danger/10">
-                    Remove
-                  </Button>
-                ) : (
-                  <Button variant="secondary" size="sm" onClick={handleInstallDxvk} isLoading={dxvkLoading}
-                    disabled={dxvkLoading || !settings.installationDirectory || folderStatus === "cloud"}
-                    className="h-7 px-2.5 text-[11px]">
-                    {dxvkLoading ? "Installing..." : "Install"}
-                  </Button>
-                )}
+                <Select
+                  value="wine"
+                  onChange={(val) => setWindowsLayer({ language: val })}
+                  className="w-32"
+                  options={[
+                    { value: "wine", label: "Wine" },
+                    { value: "proton", label: "Proton" },
+                  ]}
+                />
               </div>
-
-              {dxvkError && (
-                <p className="text-[10px] text-danger flex items-center gap-1 py-2">
-                  <AlertTriangle size={10} /> {dxvkError}
-                </p>
-              )}
-              {folderStatus === "cloud" && (
-                <p className="text-[10px] text-danger flex items-center gap-1 py-2">
-                  <AlertTriangle size={10} /> DXVK cannot be installed in a cloud storage folder
-                </p>
               )}
 
               <div className="py-3">
@@ -565,6 +619,8 @@ export function SettingsScreen() {
         isOpen={gameSettingsOpen}
         onClose={() => setGameSettingsOpen(false)}
       />
+      </>
+      )}
     </div>
   );
 }
