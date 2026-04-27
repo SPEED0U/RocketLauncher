@@ -740,7 +740,7 @@ export function SettingsScreen() {
                 </div>
                 <Select
                   value="wine"
-                  onChange={(val) => setWindowsLayer({ language: val })}
+                  onChange={(_val) => { /* TODO: implement Windows layer switching */ }}
                   className="w-32"
                   options={[
                     { value: "wine", label: "Wine" },
