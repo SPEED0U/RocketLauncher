@@ -1,6 +1,6 @@
 [package]
 name = "rocket-launcher"
-version = "1.3.2"
+version = "1.3.3"
 description = "Rocket Launcher for Need for Speed: World"
 authors = ["speedou"]
 license = "MIT"

@@ -1855,7 +1855,15 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         .map_err(|e| format!("Failed to parse update info: {}", e))?;
     
     
-    if update_info.version != CURRENT_VERSION {
+    fn parse_semver(v: &str) -> (u32, u32, u32) {
+        let parts: Vec<u32> = v.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        (parts.get(0).copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0), parts.get(2).copied().unwrap_or(0))
+    }
+
+    let remote = parse_semver(&update_info.version);
+    let current = parse_semver(CURRENT_VERSION);
+
+    if remote > current {
         Ok(Some(update_info))
     } else {
         Ok(None)

@@ -228,6 +228,26 @@ struct PackageWork {
     needed_sections: std::collections::BTreeSet<u32>,
 }
 
+/// Builds a rayon thread pool limited to half the available cores (min 1, max 4).
+/// This prevents heavy CPU work from starving the WebView UI on low-end machines.
+fn limited_pool() -> rayon::ThreadPool {
+    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let threads = (cpus / 2).max(1).min(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap())
+}
+
+/// Single-threaded pool for disk-IO intensive verification.
+/// Avoids saturating the disk and starving the WebView on low-end machines.
+fn io_pool() -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap())
+}
+
 #[command]
 pub async fn download_game(
     app: AppHandle,
@@ -255,7 +275,6 @@ pub async fn download_game(
     });
 
     let mut packages: Vec<PackageWork> = Vec::new();
-    let verify_sem = Arc::new(Semaphore::new(num_cpus * 2));
 
     for (pkg_path, label) in &packages_config {
         let pkg_url = if pkg_path.is_empty() {
@@ -286,32 +305,47 @@ pub async fn download_game(
             downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
         });
 
-        let mut verify_handles = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            let file_path = game_dir.join(strip_first_component(&entry.path)).join(&entry.file);
-            let expected_hash = entry.hash.clone();
-            let sem = verify_sem.clone();
-            verify_handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || {
-                    if !file_path.exists() {
-                        return true;
-                    }
+        // Async sequential verification: one spawn_blocking per file + yield_now()
+        // between each so the tokio runtime (and WebView) stays fully responsive.
+        let total_entries = entries.len() as u32;
+        let entries_for_verify: Vec<(PathBuf, Option<String>)> = entries.iter()
+            .map(|e| (
+                game_dir.join(strip_first_component(&e.path)).join(&e.file),
+                e.hash.clone()
+            ))
+            .collect();
+        let label_str = label.to_string();
+        let mut verified_needs: Vec<bool> = Vec::with_capacity(total_entries as usize);
+        let mut done: u32 = 0;
+        for (file_path, expected_hash) in entries_for_verify {
+            let needs = tokio::task::spawn_blocking(move || {
+                if !file_path.exists() {
+                    true
+                } else {
                     match expected_hash {
                         Some(expected) => md5_base64_file(&file_path)
                             .map(|actual| actual != expected)
                             .unwrap_or(true),
                         None => false,
                     }
-                })
-                .await
-                .unwrap_or(true)
-            }));
-        }
+                }
+            }).await.unwrap_or(true);
+            verified_needs.push(needs);
+            done += 1;
+            if done % 50 == 0 || done == total_entries {
+                let _ = app.emit("download-progress", DownloadEvent {
+                    status: "verifying".into(),
+                    file_name: format!("[{}] Verifying... {}/{}", label_str, done, total_entries),
+                    current_file: done, total_files: total_entries,
+                    downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
+                });
+            }
+            tokio::task::yield_now().await;
+        };
 
         let mut files_to_download: Vec<IndexFileEntry> = Vec::new();
-        for (i, handle) in verify_handles.into_iter().enumerate() {
-            if handle.await.unwrap_or(true) {
+        for (i, needs) in verified_needs.into_iter().enumerate() {
+            if needs {
                 files_to_download.push(entries[i].clone());
             }
         }
@@ -494,6 +528,8 @@ pub async fn download_game(
     let gd = game_dir.clone();
     let extract_errors: Vec<String> = tokio::task::spawn_blocking(move || {
         use rayon::prelude::*;
+        let pool = limited_pool();
+        pool.install(|| {
         all_entries
             .into_par_iter()
             .filter_map(|(entry, secs)| {
@@ -521,6 +557,7 @@ pub async fn download_game(
                 None
             })
             .collect()
+        })
     })
     .await
     .unwrap_or_else(|e| vec![e.to_string()]);
@@ -842,29 +879,29 @@ pub async fn download_modnet_modules(
         downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
     });
 
-    let modules_vec: Vec<(String, String)> = modules.iter()
-        .map(|(k, v)| (k.clone(), v.to_lowercase()))
-        .collect();
-    let game_dir_v = game_dir.clone();
-    let verify_results = tokio::task::spawn_blocking(move || {
-        use rayon::prelude::*;
-        modules_vec.par_iter().map(|(name, expected)| {
-            let dll_path = game_dir_v.join(name);
-            let needs = if dll_path.exists() {
-                sha256_hex_file(&dll_path)
-                    .map(|actual| actual != *expected)
-                    .unwrap_or(true)
+    // Async sequential verification: one spawn_blocking per file + yield_now()
+    let mut dlls_to_download: Vec<String> = Vec::new();
+    let mut modnet_done: u32 = 0;
+    for (name, expected) in &modules_vec {
+        let path = game_dir.join(name);
+        let exp = expected.clone();
+        let needs = tokio::task::spawn_blocking(move || {
+            if path.exists() {
+                sha256_hex_file(&path).map(|actual| actual != exp).unwrap_or(true)
             } else {
                 true
-            };
-            (name.clone(), needs)
-        }).collect::<Vec<_>>()
-    }).await.map_err(|e| e.to_string())?;
-
-    let mut dlls_to_download: Vec<String> = Vec::new();
-    for (name, needs) in verify_results {
-        if needs { dlls_to_download.push(name); }
-    }
+            }
+        }).await.unwrap_or(true);
+        if needs { dlls_to_download.push(name.clone()); }
+        modnet_done += 1;
+        let _ = app.emit("download-progress", DownloadEvent {
+            status: "verifying".into(),
+            file_name: format!("Checking ModNet modules... {}/{}", modnet_done, total),
+            current_file: modnet_done, total_files: total,
+            downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
+        });
+        tokio::task::yield_now().await;
+}
 
     if dlls_to_download.is_empty() {
         let _ = app.emit("download-progress", DownloadEvent {
@@ -1084,36 +1121,52 @@ pub async fn download_mods(
     let cache_dir = game_dir.join("MODS").join(&server_hash);
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
 
-    let _total = entries.len() as u32;
+    let total_mods = entries.len() as u32;
+
+    let _ = app.emit("download-progress", DownloadEvent {
+        status: "verifying".into(),
+        file_name: "Verifying mods...".into(),
+        current_file: 0, total_files: total_mods,
+        downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
+    });
 
     let entries_vec: Vec<(String, Option<String>)> = entries.iter()
         .map(|e| (e.name.clone().unwrap_or_default(), e.checksum.clone()))
         .collect();
-    let cache_dir_v = cache_dir.clone();
-    let verify_results = tokio::task::spawn_blocking(move || {
-        use rayon::prelude::*;
-        entries_vec.par_iter().map(|(name, expected)| {
-            let cached_file = cache_dir_v.join(name);
-            if !cached_file.exists() {
-                return (name.clone(), true, false);
-            }
-            match expected {
-                Some(exp) => {
-                    let mismatch = sha1_hex_file(&cached_file)
-                        .map(|actual| actual != exp.to_lowercase())
-                        .unwrap_or(true);
-                    (name.clone(), mismatch, mismatch)
-                }
-                None => (name.clone(), false, false),
-            }
-        }).collect::<Vec<_>>()
-    }).await.map_err(|e| e.to_string())?;
 
+    // Async sequential verification: one spawn_blocking per file + yield_now()
     let mut mods_to_download: Vec<String> = Vec::new();
     let mut any_mismatch = false;
-    for (name, needs_dl, is_mismatch) in verify_results {
+    let mut mods_done: u32 = 0;
+    for (name, expected) in entries_vec {
+        let cached_file = cache_dir.join(&name);
+        let (needs_dl, is_mismatch) = tokio::task::spawn_blocking(move || {
+            if !cached_file.exists() {
+                (true, false)
+            } else {
+                match expected {
+                    Some(exp) => {
+                        let mismatch = sha1_hex_file(&cached_file)
+                            .map(|actual| actual != exp.to_lowercase())
+                            .unwrap_or(true);
+                        (mismatch, mismatch)
+                    }
+                    None => (false, false),
+                }
+            }
+        }).await.unwrap_or((true, false));
         if needs_dl { mods_to_download.push(name); }
         if is_mismatch { any_mismatch = true; }
+        mods_done += 1;
+        if mods_done % 10 == 0 || mods_done == total_mods {
+            let _ = app.emit("download-progress", DownloadEvent {
+                status: "verifying".into(),
+                file_name: format!("Verifying mods... {}/{}", mods_done, total_mods),
+                current_file: mods_done, total_files: total_mods,
+                downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
+            });
+        }
+        tokio::task::yield_now().await;
     }
 
     if mods_to_download.is_empty() {
