@@ -4,7 +4,7 @@ version = "1.2.0"
 description = "Rocket Launcher for Need for Speed: World"
 authors = ["speedou"]
 license = "MIT"
-repository = "https://github.com/SoapboxRaceWorld/GameLauncher_NFSW"
+repository = "https://github.com/SPEED0U/RocketLauncher"
 edition = "2021"
 rust-version = "1.77.2"
 

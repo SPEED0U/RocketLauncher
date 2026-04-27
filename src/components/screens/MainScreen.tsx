@@ -461,7 +461,7 @@ export function MainScreen() {
         <div className="w-[24rem] shrink-0">
           <div className="bg-surface border border-border rounded-xl p-5 relative">
               <h3 className="text-[10px] font-semibold mb-4 uppercase tracking-widest text-muted">
-                {isLoggedIn ? "Launch" : needsGameFiles ? "Download" : "Sign In"}
+                {isLoggedIn ? "Launch" : needsGameFiles ? "Download" : "SIGN IN"}
               </h3>
               <LoginForm
                 needsGameFiles={needsGameFiles}
@@ -494,11 +494,16 @@ export function MainScreen() {
                       </span>
                     </div>
 
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-sm font-mono text-muted">{downloadPercent.toFixed(1)}%</span>
+                      <span className="text-[9px] text-muted font-mono">{formatSpeed(downloadProgress.speed)}</span>
+                    </div>
+
                     <ProgressBar
                       value={downloadPercent}
                       variant="primary"
                       size="sm"
-                      showPercent
+                      showPercent={false}
                     />
 
                     <div className="flex justify-between text-[9px] text-muted font-mono">
@@ -507,7 +512,6 @@ export function MainScreen() {
                           ? `${formatBytes(downloadProgress.downloadedBytes)} / ${formatBytes(downloadProgress.totalBytes)}`
                           : formatBytes(downloadProgress.downloadedBytes)}
                       </span>
-                      <span>{formatSpeed(downloadProgress.speed)}</span>
                       <span>ETA {formatETA(downloadProgress.eta || 0)}</span>
                     </div>
 

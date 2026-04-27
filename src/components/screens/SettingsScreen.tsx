@@ -10,24 +10,37 @@ import {
   Gamepad2,
   Monitor,
   Shield,
+  ShieldCheck,
+  ShieldAlert,
+  ShieldOff,
   Palette,
   Eye,
   Download,
   CheckCircle,
+  CheckCircle2,
   AlertTriangle,
+  AlertCircle,
+  XCircle,
   Sliders,
   Cpu,
   ImageOff,
   Layers,
+  Trash2,
+  RefreshCw,
+  Loader2,
+  Flame,
+  Bug,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
-import { pickGameFolder, validateGameFolder, fetchCDNListRaw, verifyGameFiles, repairGameFiles, getGameLanguage, setGameLanguage } from "@/lib/tauri-api";
+import { pickGameFolder, validateGameFolder, fetchCDNListRaw, verifyGameFiles, repairGameFiles, getGameLanguage, setGameLanguage, removeServerMods } from "@/lib/tauri-api";
 import { isCloudDrivePath } from "@/lib/utils";
 import { useLauncherStore } from "@/stores/launcherStore";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Select } from "@/components/ui/Select";
 import { Modal } from "@/components/ui/Modal";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { GameSettingsEditor } from "./GameSettingsEditor";
+import { invoke } from "@tauri-apps/api/core";
 import type { CDNEntry } from "@/lib/types";
 
 function Toggle({
@@ -88,7 +101,12 @@ export function SettingsScreen() {
   const [autoVerifyMessage, setAutoVerifyMessage] = useState("");
   const [verifyPercent, setVerifyPercent] = useState(0);
   const [verifyCurrentFile, setVerifyCurrentFile] = useState("");
+  const [verifyPanelVisible, setVerifyPanelVisible] = useState(false);
+  const [verifyPanelExiting, setVerifyPanelExiting] = useState(false);
+  const verifyPanelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isRemovingMods, setIsRemovingMods] = useState(false);
   const [gameSettingsOpen, setGameSettingsOpen] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const [dxvkInstalled, setDxvkInstalled] = useState<boolean | null>(null);
   const [dxvkVersion, setDxvkVersion] = useState<string | null>(null);
   const [dxvkLoading, setDxvkLoading] = useState(false);
@@ -97,6 +115,26 @@ export function SettingsScreen() {
   const [systemLoaded, setSystemLoaded] = useState(false);
   const [homeDir, setHomeDir] = useState<string>("");
   const unlistenRef = useRef<(() => void) | null>(null);
+
+  // Security state
+  const gamePath = settings.installationDirectory ?? "";
+  const [isScanning, setIsScanning] = useState(false);
+  const [firewallApiOk, setFirewallApiOk] = useState<boolean | null>(null);
+  const [firewallRows, setFirewallRows] = useState<{ launcher: string; game: string }>({ launcher: "unknown", game: "unknown" });
+  const [isAddingFwLauncher, setIsAddingFwLauncher] = useState(false);
+  const [isAddingFwGame, setIsAddingFwGame] = useState(false);
+  const [isRemovingFwLauncher, setIsRemovingFwLauncher] = useState(false);
+  const [isRemovingFwGame, setIsRemovingFwGame] = useState(false);
+  const [defenderApiOk, setDefenderApiOk] = useState<boolean | null>(null);
+  const [defenderRows, setDefenderRows] = useState<{ launcher: string; game: string }>({ launcher: "unknown", game: "unknown" });
+  const [isAddingDefLauncher, setIsAddingDefLauncher] = useState(false);
+  const [isAddingDefGame, setIsAddingDefGame] = useState(false);
+  const [isRemovingDefLauncher, setIsRemovingDefLauncher] = useState(false);
+  const [isRemovingDefGame, setIsRemovingDefGame] = useState(false);
+  const [permRows, setPermRows] = useState<{ launcher: string; game: string }>({ launcher: "unknown", game: "unknown" });
+  const [isFixingPermLauncher, setIsFixingPermLauncher] = useState(false);
+  const [isFixingPermGame, setIsFixingPermGame] = useState(false);
+  const [secConfirmDialog, setSecConfirmDialog] = useState<{ open: boolean; title: string; message: string; onConfirm: () => void }>({ open: false, title: "", message: "", onConfirm: () => {} });
 
   useEffect(() => {
     fetchCDNListRaw().then(setCdnList).catch(() => {});
@@ -175,6 +213,9 @@ export function SettingsScreen() {
   }, [settings.installationDirectory]);
 
   async function runAutoVerify(gamePath: string, cdnUrl: string) {
+    if (verifyPanelTimerRef.current) clearTimeout(verifyPanelTimerRef.current);
+    setVerifyPanelExiting(false);
+    setVerifyPanelVisible(true);
     setAutoVerifyStatus("verifying");
     setAutoVerifyMessage("Scanning game files...");
     setVerifyPercent(0);
@@ -200,7 +241,89 @@ export function SettingsScreen() {
       setAutoVerifyMessage(err instanceof Error ? err.message : String(err));
     } finally {
       setAutoVerifying(false);
+      verifyPanelTimerRef.current = setTimeout(() => {
+        setVerifyPanelExiting(true);
+        verifyPanelTimerRef.current = setTimeout(() => {
+          setVerifyPanelVisible(false);
+          setVerifyPanelExiting(false);
+          setAutoVerifyStatus("idle");
+        }, 300);
+      }, 3000);
     }
+  }
+
+  async function handleRemoveServerMods() {
+    if (!settings.installationDirectory) return;
+    setIsRemovingMods(true);
+    try {
+      await removeServerMods(settings.installationDirectory);
+    } catch {}
+    finally {
+      setIsRemovingMods(false);
+    }
+  }
+
+  async function runSecurityChecks() {
+    setIsScanning(true);
+    setFirewallRows({ launcher: "scanning", game: "scanning" });
+    setDefenderRows({ launcher: "scanning", game: "scanning" });
+    setPermRows({ launcher: "scanning", game: "scanning" });
+    await Promise.allSettled([
+      (async () => {
+        try {
+          await invoke("check_firewall_api");
+          setFirewallApiOk(true);
+          const r = await invoke<{ has_launcher: boolean; has_game: boolean }>("check_firewall_rules");
+          setFirewallRows({ launcher: r.has_launcher ? "ok" : "missing", game: r.has_game ? "ok" : "missing" });
+        } catch { setFirewallApiOk(false); setFirewallRows({ launcher: "error", game: "error" }); }
+      })(),
+      (async () => {
+        try {
+          await invoke("check_defender_api");
+          setDefenderApiOk(true);
+          const r = await invoke<{ has_launcher: boolean; has_game: boolean }>("check_defender_exclusions", { gamePath });
+          setDefenderRows({ launcher: r.has_launcher ? "ok" : "missing", game: r.has_game ? "ok" : "missing" });
+        } catch { setDefenderApiOk(false); setDefenderRows({ launcher: "error", game: "error" }); }
+      })(),
+      (async () => {
+        try {
+          const r = await invoke<{ launcher_ok: boolean; game_ok: boolean }>("check_folder_permissions", { gamePath });
+          setPermRows({ launcher: r.launcher_ok ? "ok" : "missing", game: r.game_ok ? "ok" : "missing" });
+        } catch { setPermRows({ launcher: "error", game: "error" }); }
+      })(),
+    ]);
+    setIsScanning(false);
+  }
+
+  useEffect(() => { if (isWindows) runSecurityChecks(); }, [gamePath, isWindows]);
+
+  async function addFwLauncher() { setIsAddingFwLauncher(true); try { await invoke("add_firewall_rules", { gamePath, which: "launcher" }); setFirewallRows(r => ({ ...r, launcher: "ok" })); } catch { setFirewallRows(r => ({ ...r, launcher: "error" })); } finally { setIsAddingFwLauncher(false); } }
+  async function addFwGame() { setIsAddingFwGame(true); try { await invoke("add_firewall_rules", { gamePath, which: "game" }); setFirewallRows(r => ({ ...r, game: "ok" })); } catch { setFirewallRows(r => ({ ...r, game: "error" })); } finally { setIsAddingFwGame(false); } }
+  function confirmRemoveFw(which: "launcher" | "game") {
+    setSecConfirmDialog({ open: true, title: "Remove Firewall Rule", message: `Remove the ${which} firewall rule?`, onConfirm: async () => {
+      setSecConfirmDialog(d => ({ ...d, open: false }));
+      if (which === "launcher") { setIsRemovingFwLauncher(true); try { await invoke("remove_firewall_rules", { which: "launcher" }); setFirewallRows(r => ({ ...r, launcher: "missing" })); } catch { setFirewallRows(r => ({ ...r, launcher: "error" })); } finally { setIsRemovingFwLauncher(false); } }
+      else { setIsRemovingFwGame(true); try { await invoke("remove_firewall_rules", { which: "game" }); setFirewallRows(r => ({ ...r, game: "missing" })); } catch { setFirewallRows(r => ({ ...r, game: "error" })); } finally { setIsRemovingFwGame(false); } }
+    }});
+  }
+  async function addDefLauncher() { setIsAddingDefLauncher(true); try { await invoke("add_defender_exclusions", { gamePath, which: "launcher" }); setDefenderRows(r => ({ ...r, launcher: "ok" })); } catch { setDefenderRows(r => ({ ...r, launcher: "error" })); } finally { setIsAddingDefLauncher(false); } }
+  async function addDefGame() { setIsAddingDefGame(true); try { await invoke("add_defender_exclusions", { gamePath, which: "game" }); setDefenderRows(r => ({ ...r, game: "ok" })); } catch { setDefenderRows(r => ({ ...r, game: "error" })); } finally { setIsAddingDefGame(false); } }
+  function confirmRemoveDef(which: "launcher" | "game") {
+    setSecConfirmDialog({ open: true, title: "Remove Defender Exclusion", message: `Remove the ${which} Defender exclusion?`, onConfirm: async () => {
+      setSecConfirmDialog(d => ({ ...d, open: false }));
+      if (which === "launcher") { setIsRemovingDefLauncher(true); try { await invoke("remove_defender_exclusions", { gamePath, which: "launcher" }); setDefenderRows(r => ({ ...r, launcher: "missing" })); } catch { setDefenderRows(r => ({ ...r, launcher: "error" })); } finally { setIsRemovingDefLauncher(false); } }
+      else { setIsRemovingDefGame(true); try { await invoke("remove_defender_exclusions", { gamePath, which: "game" }); setDefenderRows(r => ({ ...r, game: "missing" })); } catch { setDefenderRows(r => ({ ...r, game: "error" })); } finally { setIsRemovingDefGame(false); } }
+    }});
+  }
+  async function fixPermLauncher() { setIsFixingPermLauncher(true); try { await invoke("fix_folder_permissions", { gamePath: "" }); setPermRows(r => ({ ...r, launcher: "ok" })); } catch { setPermRows(r => ({ ...r, launcher: "error" })); } finally { setIsFixingPermLauncher(false); } }
+  async function fixPermGame() { setIsFixingPermGame(true); try { await invoke("fix_folder_permissions", { gamePath }); setPermRows(r => ({ ...r, game: "ok" })); } catch { setPermRows(r => ({ ...r, game: "error" })); } finally { setIsFixingPermGame(false); } }
+
+  function secSectionStatus(rows: { launcher: string; game: string }) {
+    if (rows.launcher === "scanning" || rows.game === "scanning") return "scanning";
+    if (rows.launcher === "error" || rows.game === "error") return "error";
+    if (rows.launcher === "unknown" && rows.game === "unknown") return "unknown";
+    if (rows.launcher === "ok" && rows.game === "ok") return "ok";
+    return "missing";
   }
 
   async function checkDxvk() {
@@ -267,15 +390,15 @@ export function SettingsScreen() {
   }
 
   return (
-    <div className="flex-1 relative flex items-center justify-center p-4 overflow-hidden">
+    <div className="flex-1 flex flex-col min-h-0">
       {!systemLoaded ? (
-        <div className="flex flex-col items-center justify-center gap-3">
+        <div className="flex-1 flex flex-col items-center justify-center gap-3">
           <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin" />
           <p className="text-xs text-muted">Loading system info...</p>
         </div>
       ) : (
-      <>
-      <div className="absolute top-4 left-4 right-4 flex items-center justify-between">
+      <div className="animate-fade-in flex-1 flex flex-col min-h-0">
+      <div className="shrink-0 flex items-center justify-between px-4 py-3 sticky top-0 z-20">
         <h1 className="text-base font-bold">Settings</h1>
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="sm" onClick={resetSettings} disabled={isAutoVerifying} className="h-7 px-3 text-[11px]">
@@ -287,81 +410,110 @@ export function SettingsScreen() {
           </Button>
         </div>
       </div>
+      <div className="flex-1 relative min-h-0">
+      <div className="h-full overflow-y-auto px-4 py-3" onScroll={e => setScrolled((e.target as HTMLElement).scrollTop > 0)} style={{ maskImage: scrolled ? "linear-gradient(to bottom, transparent 0px, black 24px)" : undefined, WebkitMaskImage: scrolled ? "linear-gradient(to bottom, transparent 0px, black 24px)" : undefined, transition: "mask-image 0.2s" }}>
       <div className="w-full grid grid-cols-3 gap-3">
-        <section className="col-span-2 border border-border rounded-xl bg-surface overflow-hidden flex flex-col">
+        <section className="col-span-2 border border-border rounded-xl bg-surface overflow-hidden flex flex-col relative">
           <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/50 shrink-0">
             <FolderOpen size={15} className="text-primary shrink-0" />
             <div>
               <h2 className="text-xs font-bold tracking-wide uppercase">Installation</h2>
               <p className="text-[10px] text-muted">Game directory and file integrity</p>
             </div>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleRemoveServerMods}
+                disabled={!settings.installationDirectory || isRemovingMods || isAutoVerifying}
+                isLoading={isRemovingMods}
+                className="h-7 px-3 text-[11px] text-danger hover:bg-danger/10"
+              >
+                <Trash2 size={11} className="mr-1" />
+                Remove Mods
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => runAutoVerify(settings.installationDirectory, settings.selectedCDN)}
+                disabled={folderStatus !== "valid" || !settings.selectedCDN || isAutoVerifying}
+                isLoading={autoVerifyStatus === "verifying" || autoVerifyStatus === "repairing"}
+                className="h-7 px-3 text-[11px]"
+              >
+                <Shield size={11} className="mr-1" />
+                {autoVerifyStatus === "verifying" ? "Scanning..." : autoVerifyStatus === "repairing" ? "Repairing..." : "Verify Files"}
+              </Button>
+            </div>
           </div>
-          <div className="px-4 py-3 space-y-3 flex-1">
-            <div>
-              <label className="text-[11px] text-muted block mb-1.5">Game Directory</label>
-              <div className="flex gap-2 items-center">
-                <input
-                  type="text"
-                  value={settings.installationDirectory}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    if (isCloudDrivePath(val)) {
-                      setFolderStatus("cloud");
-                    } else {
-                      if (folderStatus === "cloud") setFolderStatus("unknown");
-                      setSettings({ installationDirectory: val });
-                    }
-                  }}
-                  placeholder={isWindows ? "C:\\Games\\NFSW" : `${homeDir}/Games/NFSW`}
-                  className="flex-1 rounded-lg border border-border bg-background/50 px-3 py-1.5 text-xs text-foreground placeholder:text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
-                />
-                <Button variant="secondary" size="sm" onClick={handlePickFolder} disabled={isAutoVerifying} className="h-7 px-2.5">
-                  <FolderOpen size={13} />
-                </Button>
-              </div>
+          <div className="px-4 py-3 flex-1">
+            <div className="flex items-center gap-2 mb-1.5">
+              <label className="text-[11px] text-muted">Game Directory</label>
               {folderStatus === "valid" && (
-                <p className="text-[10px] text-success mt-1 flex items-center gap-1">
+                <span className="text-[10px] text-success flex items-center gap-1">
                   <CheckCircle size={10} /> nfsw.exe found
-                </p>
+                </span>
               )}
               {folderStatus === "invalid" && settings.installationDirectory && (
-                <p className="text-[10px] text-accent mt-1 flex items-center gap-1">
+                <span className="text-[10px] text-accent flex items-center gap-1">
                   <AlertTriangle size={10} /> nfsw.exe not found — game will be downloaded
-                </p>
+                </span>
               )}
               {folderStatus === "cloud" && (
-                <p className="text-[10px] text-danger mt-1 flex items-center gap-1">
-                  <AlertTriangle size={10} /> Cloud storage folders (OneDrive, Google Drive…) are not supported
+                <span className="text-[10px] text-danger flex items-center gap-1">
+                  <AlertTriangle size={10} /> Cloud storage not supported
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2 items-center">
+              <input
+                type="text"
+                value={settings.installationDirectory}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  if (isCloudDrivePath(val)) {
+                    setFolderStatus("cloud");
+                  } else {
+                    if (folderStatus === "cloud") setFolderStatus("unknown");
+                    setSettings({ installationDirectory: val });
+                  }
+                }}
+                placeholder={isWindows ? "C:\\Games\\NFSW" : `${homeDir}/Games/NFSW`}
+                className="flex-1 rounded-lg border border-border bg-background/50 px-3 py-1.5 text-xs text-foreground placeholder:text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
+              />
+              <Button variant="secondary" size="sm" onClick={handlePickFolder} disabled={isAutoVerifying} className="h-7 px-2.5">
+                <FolderOpen size={13} />
+              </Button>
+            </div>
+          </div>
+          {verifyPanelVisible && (
+            <div className={`absolute bottom-0 left-0 right-0 px-4 py-2 bg-surface ${verifyPanelExiting ? "animate-fade-out" : "animate-fade-in"}`}>
+              {(autoVerifyStatus === "verifying" || autoVerifyStatus === "repairing") && (
+                <div key={autoVerifyStatus} className="space-y-1 animate-fade-in">
+                  <div className="flex items-center gap-1.5">
+                    {autoVerifyStatus === "repairing"
+                      ? <Download size={11} className="text-primary shrink-0 animate-pulse" />
+                      : <Shield size={11} className="text-primary shrink-0" />}
+                    <p className="text-[11px] font-medium text-primary">
+                      {autoVerifyMessage}
+                    </p>
+                  </div>
+                  <ProgressBar value={verifyPercent} variant="primary" size="sm" showPercent />
+                  {verifyCurrentFile && (
+                    <p className="text-[10px] text-muted truncate font-mono">{verifyCurrentFile}</p>
+                  )}
+                </div>
+              )}
+              {autoVerifyStatus === "done" && (
+                <p key="done" className="text-[10px] text-success flex items-center gap-1 animate-fade-in">
+                  <CheckCircle size={10} /> {autoVerifyMessage}
+                </p>
+              )}
+              {autoVerifyStatus === "error" && (
+                <p key="error" className="text-[10px] text-danger flex items-center gap-1 animate-fade-in">
+                  <AlertTriangle size={10} /> {autoVerifyMessage}
                 </p>
               )}
             </div>
-            {(autoVerifyStatus === "verifying" || autoVerifyStatus === "repairing") && (
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-1.5">
-                  {autoVerifyStatus === "repairing"
-                    ? <Download size={11} className="text-accent shrink-0 animate-pulse" />
-                    : <Shield size={11} className="text-primary shrink-0" />}
-                  <p className={`text-[11px] font-medium ${autoVerifyStatus === "repairing" ? "text-accent" : "text-primary"}`}>
-                    {autoVerifyMessage}
-                  </p>
-                </div>
-                <ProgressBar value={verifyPercent} variant={autoVerifyStatus === "repairing" ? "accent" : "primary"} size="sm" showPercent />
-                {verifyCurrentFile && (
-                  <p className="text-[10px] text-muted truncate font-mono">{verifyCurrentFile}</p>
-                )}
-              </div>
-            )}
-            {autoVerifyStatus === "done" && (
-              <p className="text-[10px] text-success flex items-center gap-1">
-                <CheckCircle size={10} /> {autoVerifyMessage}
-              </p>
-            )}
-            {autoVerifyStatus === "error" && (
-              <p className="text-[10px] text-danger flex items-center gap-1">
-                <AlertTriangle size={10} /> {autoVerifyMessage}
-              </p>
-            )}
-          </div>
+          )}
         </section>
         <section className="border border-border rounded-xl bg-surface overflow-hidden flex flex-col">
           <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/50 shrink-0">
@@ -615,11 +767,120 @@ export function SettingsScreen() {
 
       </div>
 
+      {isWindows && (() => {
+        const fwStatus = secSectionStatus(firewallRows);
+        const defStatus = secSectionStatus(defenderRows);
+        const permStatus = secSectionStatus(permRows);
+        const allOk = fwStatus === "ok" && defStatus === "ok" && permStatus === "ok";
+        const anyScanning = fwStatus === "scanning" || defStatus === "scanning" || permStatus === "scanning";
+
+        function SecSectionIcon({ status }: { status: string }) {
+          switch (status) {
+            case "ok":       return <ShieldCheck size={15} className="text-success shrink-0" />;
+            case "missing":  return <ShieldAlert  size={15} className="text-warning shrink-0" />;
+            case "error":    return <ShieldOff    size={15} className="text-danger  shrink-0" />;
+            case "scanning": return <Shield       size={15} className="text-primary animate-pulse shrink-0" />;
+            default:         return <Shield       size={15} className="text-muted   shrink-0" />;
+          }
+        }
+
+        function SecStatusBadge({ status }: { status: string }) {
+          switch (status) {
+            case "scanning": return <span className="flex items-center gap-1 text-[11px] text-primary whitespace-nowrap"><Loader2 size={11} className="animate-spin" /> Scanning...</span>;
+            case "ok":       return <span className="flex items-center gap-1 text-[11px] text-success whitespace-nowrap"><CheckCircle2 size={11} /> Protected</span>;
+            case "missing":  return <span className="flex items-center gap-1 text-[11px] text-warning whitespace-nowrap"><AlertCircle size={11} /> Missing</span>;
+            case "error":    return <span className="flex items-center gap-1 text-[11px] text-danger whitespace-nowrap"><XCircle size={11} /> Error</span>;
+            default:         return <span className="text-[11px] text-muted">-</span>;
+          }
+        }
+
+        function SecItemRow({ icon, name, detail, status, addLabel, onAdd, isAdding, onRemove, isRemoving, canRemove = true }: { icon: React.ReactNode; name: string; detail?: string; status: string; addLabel: string; onAdd: () => void; isAdding: boolean; onRemove: () => void; isRemoving: boolean; canRemove?: boolean }) {
+          const busy = status === "scanning";
+          return (
+            <div className="flex items-center gap-3 py-2.5 border-b border-border/40 last:border-0">
+              <div className="shrink-0 text-muted">{icon}</div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="text-[13px] font-medium leading-tight">{name}</p>
+                  <SecStatusBadge status={status} />
+                </div>
+                {detail && <p className="text-[10px] text-muted truncate mt-0.5">{detail}</p>}
+              </div>
+              <div className="shrink-0 ml-2 w-20 flex justify-end">
+                {status !== "ok" && <Button variant="primary" size="sm" onClick={onAdd} isLoading={isAdding} disabled={busy || isRemoving} className="h-7 px-3 text-[11px] w-full">{addLabel}</Button>}
+                {status === "ok" && canRemove && <Button variant="ghost" size="sm" onClick={onRemove} isLoading={isRemoving} disabled={busy || isAdding} className="h-7 px-3 text-[11px] w-full text-muted hover:text-danger"><XCircle size={12} className="mr-1" />Remove</Button>}
+                {status === "ok" && !canRemove && <CheckCircle2 size={16} className="text-success mx-auto" />}
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div className="w-full mt-3">
+            <div className="grid grid-cols-3 gap-3">
+              <section className="border border-border rounded-xl bg-surface overflow-hidden">
+                <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/50">
+                  <SecSectionIcon status={fwStatus} />
+                  <div className="flex-1 min-w-0">
+                    <h2 className="text-xs font-bold tracking-wide uppercase truncate">Windows Firewall</h2>
+                    <p className="text-[10px] text-muted truncate">Network access rules</p>
+                  </div>
+                  {firewallApiOk === false && <span className="text-[10px] text-danger border border-danger/30 rounded px-1.5 py-0.5 shrink-0">N/A</span>}
+                </div>
+                <div className="px-4">
+                  <SecItemRow icon={<Flame size={13} />} name="Launcher" detail="Connection to game servers" status={firewallRows.launcher} addLabel="Add" onAdd={addFwLauncher} isAdding={isAddingFwLauncher} onRemove={() => confirmRemoveFw("launcher")} isRemoving={isRemovingFwLauncher} />
+                  <SecItemRow icon={<Flame size={13} />} name="Game" detail="nfsw.exe" status={firewallRows.game} addLabel="Add" onAdd={addFwGame} isAdding={isAddingFwGame} onRemove={() => confirmRemoveFw("game")} isRemoving={isRemovingFwGame} />
+                </div>
+              </section>
+              <section className="border border-border rounded-xl bg-surface overflow-hidden">
+                <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/50">
+                  <SecSectionIcon status={defStatus} />
+                  <div className="flex-1 min-w-0">
+                    <h2 className="text-xs font-bold tracking-wide uppercase truncate">Windows Defender</h2>
+                    <p className="text-[10px] text-muted truncate">Antivirus exclusions</p>
+                  </div>
+                  {defenderApiOk === false && <span className="text-[10px] text-danger border border-danger/30 rounded px-1.5 py-0.5 shrink-0">N/A</span>}
+                </div>
+                <div className="px-4">
+                  <SecItemRow icon={<Bug size={13} />} name="Launcher" detail="Launcher folder exclusion" status={defenderRows.launcher} addLabel="Exclude" onAdd={addDefLauncher} isAdding={isAddingDefLauncher} onRemove={() => confirmRemoveDef("launcher")} isRemoving={isRemovingDefLauncher} />
+                  <SecItemRow icon={<Bug size={13} />} name="Game" detail="Game folder exclusion" status={defenderRows.game} addLabel="Exclude" onAdd={addDefGame} isAdding={isAddingDefGame} onRemove={() => confirmRemoveDef("game")} isRemoving={isRemovingDefGame} />
+                </div>
+              </section>
+              <section className="border border-border rounded-xl bg-surface overflow-hidden">
+                <div className="flex items-center gap-2.5 px-4 py-3 border-b border-border/50">
+                  <SecSectionIcon status={permStatus} />
+                  <div className="flex-1 min-w-0">
+                    <h2 className="text-xs font-bold tracking-wide uppercase truncate">Folder Permissions</h2>
+                    <p className="text-[10px] text-muted truncate">Write access</p>
+                  </div>
+                </div>
+                <div className="px-4">
+                  <SecItemRow icon={<FolderOpen size={13} />} name="Launcher" detail="Updates & configuration" status={permRows.launcher} addLabel="Fix" onAdd={fixPermLauncher} isAdding={isFixingPermLauncher} onRemove={() => {}} isRemoving={false} canRemove={false} />
+                  <SecItemRow icon={<FolderOpen size={13} />} name="Game" detail={gamePath || "Set game path in settings"} status={permRows.game} addLabel="Fix" onAdd={fixPermGame} isAdding={isFixingPermGame} onRemove={() => {}} isRemoving={false} canRemove={false} />
+                </div>
+              </section>
+            </div>
+          </div>
+        );
+      })()}
+
       <GameSettingsEditor
         isOpen={gameSettingsOpen}
         onClose={() => setGameSettingsOpen(false)}
       />
-      </>
+      <ConfirmDialog
+        isOpen={secConfirmDialog.open}
+        onClose={() => setSecConfirmDialog(d => ({ ...d, open: false }))}
+        onConfirm={secConfirmDialog.onConfirm}
+        title={secConfirmDialog.title}
+        message={secConfirmDialog.message}
+        confirmText="Remove"
+        cancelText="Cancel"
+        variant="warning"
+      />
+      </div>
+      </div>
+      </div>
       )}
     </div>
   );

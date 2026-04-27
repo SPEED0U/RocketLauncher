@@ -4,8 +4,6 @@ import { cn } from "@/lib/utils";
 import { useLauncherStore } from "@/stores/launcherStore";
 import {
   Settings,
-  Shield,
-  CheckCircle,
   Bug,
   Rocket,
   Minus,
@@ -23,9 +21,6 @@ interface NavAction {
 }
 
 const allNavActions: NavAction[] = [
-  { page: "settings", icon: <Settings size={16} />, tooltip: "Settings" },
-  { page: "security", icon: <Shield size={16} />, tooltip: "Security" },
-  { page: "verify", icon: <CheckCircle size={16} />, tooltip: "Verify Files" },
   { page: "debug", icon: <Bug size={16} />, tooltip: "Diagnostics" },
 ];
 
@@ -63,7 +58,7 @@ export function TopBar() {
   const [showDebug, setShowDebug] = useState(
     process.env.NODE_ENV === "development"
   );
-  const [navActions, setNavActions] = useState(baseNavActions);
+  const [, setNavActions] = useState(baseNavActions);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -114,73 +109,58 @@ export function TopBar() {
             <Rocket size={14} className="text-primary" />
           </div>
           <div className="flex items-baseline gap-1.5">
-            <span className="font-bold text-sm tracking-wide text-gradient">
-              ROCKET
+            <span className="font-bold text-base tracking-wide text-gradient">
+              ROCKET LAUNCHER
             </span>
-            <span className="text-[9px] text-muted font-mono">{appVersion}</span>
+            <span className="text-sm text-muted font-mono font-bold">{appVersion}</span>
           </div>
         </button>
-        <div className="w-px h-5 bg-border/50 mx-1" />
-        <nav className="flex items-center gap-0.5">
-          {navActions.map((item) => (
-            <Tooltip key={item.page} label={item.tooltip}>
-              <button
-                onClick={() =>
-                  !navLocked && currentPage !== item.page && setPage(item.page)
-                }
-                disabled={navLocked || currentPage === item.page}
-                className={cn(
-                  "p-2 rounded-lg transition-smooth relative",
-                  navLocked || currentPage === item.page
-                    ? "cursor-default"
-                    : "cursor-pointer",
-                  navLocked
-                    ? "opacity-50"
-                    : "",
-                  currentPage === item.page
-                    ? "bg-primary/15 text-primary"
-                    : "text-muted hover:text-foreground hover:bg-surface-hover"
-                )}
-              >
-                {item.icon}
-              </button>
-            </Tooltip>
-          ))}
-          <div
-            className="overflow-hidden transition-all duration-300 ease-in-out"
-            style={{
-              width: showDebug ? "2rem" : "0px",
-              opacity: showDebug ? 1 : 0,
-              transform: showDebug ? "scale(1)" : "scale(0.6)",
-              pointerEvents: showDebug ? "auto" : "none",
-            }}
-          >
-            <Tooltip label="Diagnostics">
-              <button
-                onClick={() =>
-                  !navLocked && currentPage !== "debug" && setPage("debug")
-                }
-                disabled={navLocked || currentPage === "debug"}
-                className={cn(
-                  "p-2 rounded-lg transition-smooth relative",
-                  navLocked || currentPage === "debug"
-                    ? "cursor-default"
-                    : "cursor-pointer",
-                  navLocked
-                    ? "opacity-50"
-                    : "",
-                  currentPage === "debug"
-                    ? "bg-primary/15 text-primary"
-                    : "text-muted hover:text-foreground hover:bg-surface-hover"
-                )}
-              >
-                <Bug size={16} />
-              </button>
-            </Tooltip>
-          </div>
-        </nav>
       </div>
       <div className="flex items-center gap-3">
+        <div
+          className="overflow-hidden transition-all duration-300 ease-in-out"
+          style={{
+            width: showDebug ? "2rem" : "0px",
+            opacity: showDebug ? 1 : 0,
+            transform: showDebug ? "scale(1)" : "scale(0.6)",
+            pointerEvents: showDebug ? "auto" : "none",
+          }}
+        >
+          <Tooltip label="Diagnostics">
+            <button
+              onClick={() =>
+                !navLocked && currentPage !== "debug" && setPage("debug")
+              }
+              disabled={navLocked || currentPage === "debug"}
+              className={cn(
+                "p-2 rounded-lg transition-smooth relative",
+                navLocked || currentPage === "debug"
+                  ? "cursor-default"
+                  : "cursor-pointer",
+                navLocked ? "opacity-50" : "",
+                currentPage === "debug"
+                  ? "bg-primary/15 text-primary"
+                  : "text-muted hover:text-foreground hover:bg-surface-hover"
+              )}
+            >
+              <Bug size={16} />
+            </button>
+          </Tooltip>
+        </div>
+        <Tooltip label="Settings">
+          <button
+            onClick={() => !navLocked && currentPage !== "settings" && setPage("settings")}
+            disabled={navLocked || currentPage === "settings"}
+            className={cn(
+              "p-2 rounded-lg transition-smooth",
+              navLocked || currentPage === "settings" ? "cursor-default" : "cursor-pointer",
+              navLocked ? "opacity-50" : "",
+              currentPage === "settings" ? "bg-primary/15 text-primary" : "text-muted hover:text-foreground hover:bg-surface-hover"
+            )}
+          >
+            <Settings size={16} />
+          </button>
+        </Tooltip>
         <UpdateNotification />
         <div className="w-px h-5 bg-border/50" />
 

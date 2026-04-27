@@ -53,6 +53,7 @@ export function DebugScreen() {
   const { selectedServer } = useServerStore();
   const { userEmail } = useLauncherStore();
   const [copied, setCopied] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const [sysInfo, setSysInfo] = useState<SystemInfo | null>(null);
   const [hwid, setHwid] = useState("Loading...");
   const [hiddenHwid, setHiddenHwid] = useState("Loading...");
@@ -118,17 +119,18 @@ export function DebugScreen() {
   }
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden">
-      <div className="flex items-center justify-between px-5 py-4 border-b border-border shrink-0">
-        <h1 className="text-sm font-bold">Debug</h1>
-        <Button variant="secondary" size="sm" onClick={copyDebugInfo}>
-          {copied ? <Check size={14} className="mr-1" /> : <Copy size={14} className="mr-1" />}
+    <div className="flex-1 flex flex-col min-h-0">
+      <div className="shrink-0 flex items-center justify-between px-4 py-3 sticky top-0 z-20">
+        <h1 className="text-base font-bold">Diagnostics</h1>
+        <Button variant="secondary" size="sm" onClick={copyDebugInfo} className="h-7 px-3 text-[11px]">
+          {copied ? <Check size={11} className="mr-1" /> : <Copy size={11} className="mr-1" />}
           {copied ? "Copied!" : "Copy All"}
         </Button>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4">
-        <div className="grid grid-cols-3 gap-3 max-w-4xl mx-auto">
+      <div className="flex-1 relative min-h-0">
+      <div className="h-full overflow-y-auto px-4 py-3 flex flex-col justify-center" onScroll={e => setScrolled((e.target as HTMLElement).scrollTop > 0)} style={{ maskImage: scrolled ? "linear-gradient(to bottom, transparent 0px, black 24px)" : undefined, WebkitMaskImage: scrolled ? "linear-gradient(to bottom, transparent 0px, black 24px)" : undefined, transition: "mask-image 0.2s" }}>
+        <div className="grid grid-cols-3 gap-3">
 
           <Section icon={<Monitor size={15} />} title="System" description="OS and environment" className="col-span-2">
             <InfoRow label="Operating System" value={sysInfo ? `${sysInfo.os_name} ${sysInfo.os_version}` : "..."} />
@@ -171,6 +173,7 @@ export function DebugScreen() {
           </Section>
 
         </div>
+      </div>
       </div>
     </div>
   );

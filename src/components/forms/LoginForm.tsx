@@ -369,7 +369,7 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
             disabled={!selectedServer || isAutoVerifying}
             className="flex-1"
           >
-            Sign In
+            SIGN IN
           </Button>
         )}
         <Tooltip label={isLoggedIn ? "Sign out" : "Register"}>

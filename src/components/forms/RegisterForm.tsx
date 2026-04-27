@@ -100,7 +100,7 @@ export function RegisterForm() {
         </div>
         <Button className="w-full mt-8" onClick={() => setPage("main")}>
           <LogIn size={14} className="mr-2" />
-          Back to Sign In
+          Back to SIGN IN
         </Button>
       </div>
     );

@@ -9,12 +9,11 @@ import { SplashScreen } from "@/components/screens/SplashScreen";
 import { WelcomeScreen } from "@/components/screens/WelcomeScreen";
 import { MainScreen } from "@/components/screens/MainScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
-import { SecurityScreen } from "@/components/screens/SecurityScreen";
-import { VerifyScreen } from "@/components/screens/VerifyScreen";
 import { DebugScreen } from "@/components/screens/DebugScreen";
 import { RegisterScreen } from "@/components/screens/RegisterScreen";
 import { UpdatePopup } from "@/components/screens/UpdatePopup";
 import { BackgroundSlideshow } from "@/components/ui/BackgroundSlideshow";
+import { RocketLaunchOverlay } from "@/components/ui/RocketLaunchOverlay";
 import { useDiscordRPC } from "@/lib/useDiscordRPC";
 import { cleanMods } from "@/lib/tauri-api";
 
@@ -23,6 +22,7 @@ function ContentPanel() {
   const [displayedPage, setDisplayedPage] = useState(currentPage);
   const [transitionClass, setTransitionClass] = useState("animate-fade-in");
   const [isWindows, setIsWindows] = useState(true);
+  const [sysInfoLoaded, setSysInfoLoaded] = useState(false);
 
   useEffect(() => {
     import("@/lib/tauri-api")
@@ -35,7 +35,8 @@ function ContentPanel() {
           setPage("main");
         }
       })
-      .catch(() => setIsWindows(true));
+      .catch(() => setIsWindows(true))
+      .finally(() => setSysInfoLoaded(true));
 
     if (currentPage !== displayedPage) {
       setTransitionClass("animate-fade-out");
@@ -51,10 +52,6 @@ function ContentPanel() {
     switch (displayedPage) {
       case "settings":
         return <SettingsScreen />;
-      case "security":
-        return isWindows ? <SecurityScreen /> : <MainScreen />;
-      case "verify":
-        return <VerifyScreen />;
       case "debug":
         return <DebugScreen />;
       case "register":
@@ -63,6 +60,10 @@ function ContentPanel() {
         return <MainScreen />;
     }
   })();
+
+  if (!sysInfoLoaded) {
+    return <div className="flex-1 flex flex-col min-h-0" />;
+  }
 
   return (
     <div key={displayedPage} className={`flex-1 flex flex-col min-h-0 ${transitionClass}`}>
@@ -125,6 +126,7 @@ export default function Home() {
         </main>
       </div>
       <UpdatePopup latestVersion="" />
+      <RocketLaunchOverlay />
     </div>
   );
 }

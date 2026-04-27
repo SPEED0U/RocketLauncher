@@ -108,17 +108,18 @@ export function VerifyScreen() {
       const { listen } = await import("@tauri-apps/api/event");
       unlistenRepair = await listen<{
         status: string;
-        file_name: string;
-        current_file: number;
+        current_file: string;
+        current_index: number;
         total_files: number;
-      }>("download-progress", (event) => {
+        corrupted_count: number;
+      }>("verify-progress", (event) => {
         const d = event.payload;
-        if (d.status === "downloading") {
+        if (d.status === "repairing") {
           setVerifyProgress({
             status: "repairing",
-            currentIndex: d.current_file,
+            currentIndex: d.current_index,
             totalFiles: d.total_files,
-            currentFile: d.file_name,
+            currentFile: d.current_file,
           });
         }
       });

@@ -682,48 +682,11 @@ async fn repair_package(
     let total = corrupted_files.len() as u32;
     let downloaded = Arc::new(AtomicU32::new(0));
     let total_bytes = Arc::new(AtomicU64::new(0));
-    let start_time = std::time::Instant::now();
 
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
     let dl_sem = Arc::new(Semaphore::new(num_cpus.min(4)));
-
-    let progress_app = app.clone();
-    let p_downloaded = downloaded.clone();
-    let p_bytes = total_bytes.clone();
-    let progress_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let p_flag = progress_running.clone();
-    
-    let progress_handle = tokio::spawn(async move {
-        while p_flag.load(Ordering::Relaxed) {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let done = p_downloaded.load(Ordering::Relaxed);
-            let bytes = p_bytes.load(Ordering::Relaxed);
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.5 { (bytes as f64 / elapsed) as u64 } else { 0 };
-            let eta = if speed > 0 {
-                ((total - done) as f64 / (done as f64 / elapsed)) as u64
-            } else {
-                0
-            };
-            
-            let _ = progress_app.emit(
-                "download-progress",
-                DownloadEvent {
-                    status: "downloading".into(),
-                    file_name: format!("Repair {}/{}", done, total),
-                    current_file: done,
-                    total_files: total,
-                    downloaded_bytes: bytes,
-                    total_bytes: bytes,
-                    speed,
-                    eta,
-                    error: None,
-                },
-            );
-        }
-    });
 
     let mut dl_handles = Vec::new();
     for file_path in corrupted_files {
@@ -734,10 +697,12 @@ async fn repair_package(
         let sem = dl_sem.clone();
         let done = downloaded.clone();
         let bytes_arc = total_bytes.clone();
+        let app_clone = app.clone();
+        let total_clone = total;
 
         dl_handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
-            
+
             let url_path = file_path.replace(std::path::MAIN_SEPARATOR, "/");
             let url = format!("{}/unpacked/{}", base.trim_end_matches('/'), url_path.trim_start_matches('/'));
 
@@ -746,29 +711,36 @@ async fn repair_package(
                 .send()
                 .await
                 .map_err(|e| format!("Download {}: {}", file_path, e))?;
-            
+
             if !resp.status().is_success() {
                 return Err(format!("HTTP {} for {}", resp.status(), file_path));
             }
-            
+
             let data = resp
                 .bytes()
                 .await
                 .map_err(|e| format!("Read {}: {}", file_path, e))?
                 .to_vec();
-            
+
             bytes_arc.fetch_add(data.len() as u64, Ordering::Relaxed);
-            
+
             let full_path = game_path.join(&file_path);
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Create dir for {}: {}", file_path, e))?;
             }
-            
+
             std::fs::write(&full_path, &data)
                 .map_err(|e| format!("Write {}: {}", file_path, e))?;
 
-            done.fetch_add(1, Ordering::Relaxed);
+            let done_val = done.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = app_clone.emit("verify-progress", VerifyEvent {
+                status: "repairing".into(),
+                current_file: file_path.clone(),
+                current_index: done_val,
+                total_files: total_clone,
+                corrupted_count: 0,
+            });
 
             Ok::<(), String>(())
         }));
@@ -780,9 +752,6 @@ async fn repair_package(
             errors.push(e);
         }
     }
-
-    progress_running.store(false, Ordering::Relaxed);
-    let _ = progress_handle.await;
 
     if !errors.is_empty() {
         return Err(format!("Repair errors: {}", errors.join("; ")));
