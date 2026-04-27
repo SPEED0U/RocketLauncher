@@ -145,7 +145,7 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
   async function handlePlay() {
     if (!selectedServer || !settings.installationDirectory) return;
     try {
-      setGameStatus("launching");
+      setDownloadProgress({ status: "verifying", fileName: "Preparing..." });
       await cleanMods(settings.installationDirectory).catch(() => {});
       await grantFolderPermissions(settings.installationDirectory).catch(() => {});
 
@@ -165,6 +165,8 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
         logout();
         throw new Error("Invalid session — please sign in again");
       }
+
+      setGameStatus("launching");
 
       const discordAppId = selectedServerDetails?.discordApplicationID || selectedServer.discordAppId;
       await launchGame(

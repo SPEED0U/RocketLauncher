@@ -877,7 +877,33 @@ pub async fn download_modnet_modules(
     }
 
     let dl_total = dlls_to_download.len() as u32;
-    let total_modnet_bytes = Arc::new(AtomicU64::new(0));
+
+    // Phase 1: fire all GET requests in parallel to collect Content-Length headers
+    // before starting the progress loop, so total_bytes is known upfront.
+    let pre_handles: Vec<_> = dlls_to_download.iter().map(|name| {
+        let c = client.clone();
+        let url = format!("{}/launcher-modules/{}", modnet_cdn.trim_end_matches('/'), name);
+        let n = name.clone();
+        tokio::spawn(async move {
+            let resp = c.get(&url).send().await.map_err(|e| format!("{}: {}", n, e))?;
+            let len = resp.content_length().unwrap_or(0);
+            Ok::<(String, u64, reqwest::Response), String>((n, len, resp))
+        })
+    }).collect();
+
+    let mut named_responses: Vec<Result<(String, reqwest::Response), String>> = Vec::new();
+    let mut known_total = 0u64;
+    for h in pre_handles {
+        match h.await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok((name, len, resp)) => {
+                known_total += len;
+                named_responses.push(Ok((name, resp)));
+            }
+            Err(e) => named_responses.push(Err(e)),
+        }
+    }
+
+    let total_modnet_bytes = Arc::new(AtomicU64::new(known_total));
     let dl_sem = Arc::new(Semaphore::new(16));
     let dl_done = Arc::new(AtomicU32::new(0));
     let dl_bytes = Arc::new(AtomicU64::new(0));
@@ -896,10 +922,9 @@ pub async fn download_modnet_modules(
             let bytes = p_bytes.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = if elapsed > 0.5 { (bytes as f64 / elapsed) as u64 } else { 0 };
-            let eta = if speed > 0 && done < dl_total {
-                let avg_size = if done > 0 { bytes / done as u64 } else { 0 };
-                let remaining = avg_size * (dl_total - done) as u64;
-                (remaining as f64 / speed as f64) as u64
+            let total_known = p_total.load(Ordering::Relaxed);
+            let eta = if speed > 0 && total_known > bytes {
+                ((total_known - bytes) as f64 / speed as f64) as u64
             } else {
                 0
             };
@@ -907,30 +932,23 @@ pub async fn download_modnet_modules(
                 status: "downloading".into(),
                 file_name: format!("[ModNet] {}/{}", done, dl_total),
                 current_file: done, total_files: dl_total,
-                downloaded_bytes: bytes, total_bytes: p_total.load(Ordering::Relaxed),
+                downloaded_bytes: bytes, total_bytes: total_known,
                 speed, eta, error: None,
             });
         }
     });
 
+    // Phase 2: download bodies using already-open responses, limited by semaphore
     let mut dl_handles = Vec::new();
-    for dll_name in dlls_to_download {
-        let client = client.clone();
-        let cdn = modnet_cdn.clone();
-        let gd = game_dir.clone();
+    for result in named_responses {
         let sem = dl_sem.clone();
         let done = dl_done.clone();
         let bytes = dl_bytes.clone();
-        let total = total_modnet_bytes.clone();
+        let gd = game_dir.clone();
 
         dl_handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
-            let url = format!("{}/launcher-modules/{}", cdn.trim_end_matches('/'), dll_name);
-            let response = client.get(&url).send().await
-                .map_err(|e| format!("{}: {}", dll_name, e))?;
-            if let Some(len) = response.content_length() {
-                total.fetch_add(len, Ordering::Relaxed);
-            }
+            let (dll_name, response) = result?;
             let data = response.bytes().await
                 .map_err(|e| format!("{} read: {}", dll_name, e))?;
             let dll_path = gd.join(&dll_name);
@@ -1103,7 +1121,33 @@ pub async fn download_mods(
     }
 
     let dl_total = mods_to_download.len() as u32;
-    let total_mods_bytes = Arc::new(AtomicU64::new(0));
+
+    // Phase 1: fire all GET requests in parallel to collect Content-Length headers
+    // before starting the progress loop, so total_bytes is known upfront.
+    let pre_handles: Vec<_> = mods_to_download.iter().map(|name| {
+        let c = client.clone();
+        let url = format!("{}/{}", base_path.trim_end_matches('/'), name);
+        let n = name.clone();
+        tokio::spawn(async move {
+            let resp = c.get(&url).send().await.map_err(|e| format!("mod {}: {}", n, e))?;
+            let len = resp.content_length().unwrap_or(0);
+            Ok::<(String, u64, reqwest::Response), String>((n, len, resp))
+        })
+    }).collect();
+
+    let mut named_responses: Vec<Result<(String, reqwest::Response), String>> = Vec::new();
+    let mut known_total = 0u64;
+    for h in pre_handles {
+        match h.await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok((name, len, resp)) => {
+                known_total += len;
+                named_responses.push(Ok((name, resp)));
+            }
+            Err(e) => named_responses.push(Err(e)),
+        }
+    }
+
+    let total_mods_bytes = Arc::new(AtomicU64::new(known_total));
     let dl_sem = Arc::new(Semaphore::new(16));
     let dl_done = Arc::new(AtomicU32::new(0));
     let dl_bytes = Arc::new(AtomicU64::new(0));
@@ -1122,10 +1166,9 @@ pub async fn download_mods(
             let bytes = p_bytes.load(Ordering::Relaxed);
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = if elapsed > 0.5 { (bytes as f64 / elapsed) as u64 } else { 0 };
-            let eta = if speed > 0 && done < dl_total {
-                let avg_size = if done > 0 { bytes / done as u64 } else { 0 };
-                let remaining_bytes = avg_size * (dl_total - done) as u64;
-                (remaining_bytes as f64 / speed as f64) as u64
+            let total_known = p_total.load(Ordering::Relaxed);
+            let eta = if speed > 0 && total_known > bytes {
+                ((total_known - bytes) as f64 / speed as f64) as u64
             } else {
                 0
             };
@@ -1133,37 +1176,30 @@ pub async fn download_mods(
                 status: "downloading".into(),
                 file_name: format!("[MODS] {}/{}", done, dl_total),
                 current_file: done, total_files: dl_total,
-                downloaded_bytes: bytes, total_bytes: p_total.load(Ordering::Relaxed),
+                downloaded_bytes: bytes, total_bytes: total_known,
                 speed, eta, error: None,
             });
         }
     });
 
+    // Phase 2: download bodies using already-open responses, limited by semaphore
     let mut dl_handles = Vec::new();
-    for name in mods_to_download {
-        let client = client.clone();
-        let base = base_path.clone();
-        let cache = cache_dir.clone();
+    for result in named_responses {
         let sem = dl_sem.clone();
         let done = dl_done.clone();
         let bytes = dl_bytes.clone();
-        let total = total_mods_bytes.clone();
+        let cache = cache_dir.clone();
 
         dl_handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
-            let file_url = format!("{}/{}", base.trim_end_matches('/'), name);
-            let response = client.get(&file_url).send().await
-                .map_err(|e| format!("mod {}: {}", name, e))?;
-            if let Some(len) = response.content_length() {
-                total.fetch_add(len, Ordering::Relaxed);
-            }
+            let (name, response) = result?;
             let data = response.bytes().await
                 .map_err(|e| format!("mod {} read: {}", name, e))?;
             let cached_file = cache.join(&name);
             if let Some(parent) = cached_file.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            let tmp_path = cache.join(format!(".{}.tmp", name));
+            let tmp_path = cache.join(format!(".{}.tmp", &name));
             tokio::fs::write(&tmp_path, &data).await
                 .map_err(|e| format!("write mod {}: {}", name, e))?;
             tokio::fs::rename(&tmp_path, &cached_file).await

@@ -91,6 +91,14 @@ export function BackgroundSlideshow({ disabled }: { disabled?: boolean }) {
   const [showA, setShowA] = useState(true);
   const [nextImageIndex, setNextImageIndex] = useState(2);
   const [animKey, setAnimKey] = useState(2);
+  const [firstLoaded, setFirstLoaded] = useState(false);
+
+  useEffect(() => {
+    const img = new window.Image();
+    img.onload = () => setFirstLoaded(true);
+    img.onerror = () => setFirstLoaded(true);
+    img.src = SLIDESHOW_IMAGES[slideA.imageIndex];
+  }, []);
 
   useEffect(() => {
     if (disabledRef.current) return;
@@ -116,7 +124,7 @@ export function BackgroundSlideshow({ disabled }: { disabled?: boolean }) {
   }, [showA, nextImageIndex, animKey]);
 
   return (
-    <div className="absolute inset-0 overflow-hidden">
+    <div className="absolute inset-0 overflow-hidden" style={{ opacity: firstLoaded ? 1 : 0, transition: "opacity 0.3s ease" }}>
       <div
         key={`slide-a-${slideA.key}`}
         className="absolute inset-0 bg-cover bg-center will-change-transform"
