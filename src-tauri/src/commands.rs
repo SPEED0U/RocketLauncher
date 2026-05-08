@@ -1915,7 +1915,7 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     let artifact: Option<String> = raw.platforms.windows.map(|p| p.exe);
 
     #[cfg(target_os = "linux")]
-    let artifact: Option<String> = raw.platforms.linux.and_then(|p| p.appimage.or(p.deb));
+    let artifact: Option<String> = raw.platforms.linux.and_then(|p| p.deb);
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let artifact: Option<String> = None;

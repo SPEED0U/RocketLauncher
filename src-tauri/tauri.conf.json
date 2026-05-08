@@ -6,8 +6,7 @@
   "build": {
     "frontendDist": "../out",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm run dev"
   },
   "app": {
     "windows": [
@@ -31,7 +30,7 @@
   "bundle": {
     "active": true,
     "targets": [
-      "nsis", "deb"
+      "deb"
     ],
     "icon": [
       "icons/32x32.png",
