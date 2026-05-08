@@ -1061,7 +1061,7 @@ pub fn fix_folder_permissions(game_path: String) -> Result<(), String> {
 
 #[command]
 pub fn get_game_language() -> Result<String, String> {
-    let appdata = std::env::var("APPDATA").map_err(|_| "Cannot determine APPDATA")?;
+    let appdata = get_appdata()?;
     let settings_path = Path::new(&appdata)
         .join("Need for Speed World")
         .join("Settings")
@@ -1111,7 +1111,7 @@ pub fn get_game_language() -> Result<String, String> {
 
 #[command]
 pub fn set_game_language(language: String) -> Result<(), String> {
-    let appdata = std::env::var("APPDATA").map_err(|_| "Cannot determine APPDATA")?;
+    let appdata = get_appdata()?;
     let settings_path = Path::new(&appdata)
         .join("Need for Speed World")
         .join("Settings")
@@ -1511,7 +1511,7 @@ pub fn get_game_settings() -> Result<GameSettings, String> {
 
 #[command]
 pub fn test_xml_access() -> Result<String, String> {
-    let appdata = std::env::var("APPDATA").map_err(|_| "Cannot determine APPDATA")?;
+    let appdata = get_appdata()?;
     let settings_path = Path::new(&appdata)
         .join("Need for Speed World")
         .join("Settings")
@@ -1534,7 +1534,7 @@ pub fn test_xml_access() -> Result<String, String> {
 
 #[command]
 pub fn set_game_settings(settings: GameSettings) -> Result<(), String> {
-    let appdata = std::env::var("APPDATA").map_err(|_| "Cannot determine APPDATA")?;
+    let appdata = get_appdata()?;
     let settings_path = Path::new(&appdata)
         .join("Need for Speed World")
         .join("Settings")
