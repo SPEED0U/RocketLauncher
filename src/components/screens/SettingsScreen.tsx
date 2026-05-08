@@ -30,6 +30,7 @@ import {
   Loader2,
   Flame,
   Bug,
+  ExternalLink,
 } from "lucide-react";
 import { useState, useEffect, useRef } from "react";
 import { pickGameFolder, validateGameFolder, fetchCDNListRaw, verifyGameFiles, repairGameFiles, getGameLanguage, setGameLanguage, removeServerMods } from "@/lib/tauri-api";
@@ -42,6 +43,7 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { GameSettingsEditor } from "./GameSettingsEditor";
 import { invoke } from "@tauri-apps/api/core";
 import type { CDNEntry } from "@/lib/types";
+import { openUrl } from '@tauri-apps/plugin-opener';
 
 function Toggle({
   checked,
@@ -111,6 +113,8 @@ export function SettingsScreen() {
   const [dxvkVersion, setDxvkVersion] = useState<string | null>(null);
   const [dxvkLoading, setDxvkLoading] = useState(false);
   const [dxvkError, setDxvkError] = useState("");
+  const [wineInstalled, setWineInstalled] = useState(false);
+  const [wineVersion, setWineVersion] = useState("Unknown");
   const [isWindows, setIsWindows] = useState<boolean | null>(null);
   const [systemLoaded, setSystemLoaded] = useState(false);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -388,6 +392,22 @@ export function SettingsScreen() {
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   }
+
+  useEffect(() => {
+    const checkWine = async () => {
+      try {
+        const version = await invoke<string>("get_wine_version");
+
+        setWineInstalled(true);
+        setWineVersion(version);
+      } catch {
+        setWineInstalled(false);
+        setWineVersion("Unknown");
+      }
+    };
+
+    checkWine();
+  }, []);
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -730,24 +750,34 @@ export function SettingsScreen() {
               )}
 
               {isWindows == false && (
-                            <div className="flex items-center justify-between py-3">
-                <div className="flex items-center gap-3">
-                  <span className="text-muted"><Layers size={13} /></span>
-                  <div>
-                    <p className="text-sm font-medium">Windows Layer</p>
-                    <p className="text-xs text-muted mt-0.5">Game compatibility environment</p>
+                <>
+                  <div className="flex items-center justify-between py-3">
+                    <div className="flex items-center gap-3">
+                      <span className={dxvkInstalled ? "text-success" : "text-muted"}>
+                        <Layers size={13} />
+                      </span>
+                      <div>
+                        <div className="flex items-center gap-1.5">
+                          <p className="text-sm font-medium">Wine Installation</p>
+                          {dxvkInstalled && (
+                            <span className="text-[9px] font-mono text-muted">v{dxvkVersion ?? "2.4"}</span>
+                          )}
+                        </div>
+                        <p className={`${wineInstalled ? 'text-success' : 'text-danger'} text-xs mt-0.5`}>
+                          {wineInstalled ? `Version: ${wineVersion}` : "Version: Unknown"}
+                        </p>
+                      </div>
+                    </div>
+                    {wineInstalled ? (
+                      <></>
+                    ) : (
+                      <Button variant="secondary" size="sm" onClick={() => openUrl("https://gitlab.winehq.org/wine/wine/-/wikis/Download")}
+                        className="h-7 px-2.5 text-[11px]">
+                        Install Guide  <ExternalLink size="12" />
+                      </Button>
+                    )}
                   </div>
-                </div>
-                <Select
-                  value="wine"
-                  onChange={(_val) => { /* TODO: implement Windows layer switching */ }}
-                  className="w-32"
-                  options={[
-                    { value: "wine", label: "Wine" },
-                    { value: "proton", label: "Proton" },
-                  ]}
-                />
-              </div>
+                </>
               )}
 
               <div className="py-3">

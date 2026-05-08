@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { ServerInfo, ServerListEntry, ServerDetails, CDNEntry } from "./types";
 import { URLS } from "./urls";
+import path from "path";
 
 interface FetchResponse {
   status: number;
@@ -373,8 +374,8 @@ export async function pickGameFolder(): Promise<string | null> {
   return selected as string | null;
 }
 
-export async function validateGameFolder(path: string): Promise<boolean> {
-  return invoke<boolean>("check_file_exists", { path: `${path}\\nfsw.exe` });
+export async function validateGameFolder(nfsw_path: string): Promise<boolean> {
+  return invoke<boolean>("check_file_exists", { path: path.join(nfsw_path, "nfsw.exe") });
 }
 
 export async function fetchCDNListRaw(): Promise<CDNEntry[]> {

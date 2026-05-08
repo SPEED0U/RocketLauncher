@@ -3,12 +3,14 @@ use sha1::Sha1;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use tauri::command;
 use tauri::Manager;
 use tauri::Emitter;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use std::process::Command;
 
 static HWID: OnceLock<String> = OnceLock::new();
 static HIDDEN_HWID: OnceLock<String> = OnceLock::new();
@@ -1258,10 +1260,35 @@ impl Default for GameSettings {
     }
 }
 
+fn get_appdata() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .map_err(|_| "Cannot determine APPDATA".to_string())?)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME")
+            .map_err(|_| "Cannot determine HOME".to_string())?;
+
+        let user = std::path::Path::new(&home)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or("Cannot determine username")?;
+
+        Ok(PathBuf::from(format!(
+            "{}/.wine/drive_c/users/{}/AppData/Roaming",
+            home, user
+        )))
+    }
+}
+
 #[command]
 pub fn get_game_settings() -> Result<GameSettings, String> {
     
-    let appdata = std::env::var("APPDATA").map_err(|_| "Cannot determine APPDATA")?;
+    let appdata = get_appdata()?;
     
     let settings_path = Path::new(&appdata)
         .join("Need for Speed World")
@@ -2036,4 +2063,20 @@ pub fn remove_dxvk(game_path: String) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[command]
+pub fn get_wine_version() -> Result<String, String> {
+    let output = Command::new("wine")
+        .arg("--version")
+        .output()
+        .map_err(|_| "Wine not installed")?;
+
+    if !output.status.success() {
+        return Err("Wine command failed".into());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_string())
 }

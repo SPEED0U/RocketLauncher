@@ -17,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let _ = commands::get_hwid();
             let _ = commands::get_hidden_hwid();
@@ -79,6 +80,7 @@ pub fn run() {
             commands::check_dxvk,
             commands::install_dxvk,
             commands::remove_dxvk,
+            commands::get_wine_version,
             downloader::download_game,
             downloader::verify_game_files,
             downloader::repair_game_files,

@@ -43,6 +43,7 @@ rayon = "1"
 sysinfo = "0.33"
 discord-rich-presence = "0.2"
 flate2 = "1"
+tauri-plugin-opener = "2.5.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

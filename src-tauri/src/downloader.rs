@@ -882,7 +882,7 @@ pub async fn download_modnet_modules(
     // Async sequential verification: one spawn_blocking per file + yield_now()
     let mut dlls_to_download: Vec<String> = Vec::new();
     let mut modnet_done: u32 = 0;
-    for (name, expected) in &modules_vec {
+    for (name, expected) in &modules {
         let path = game_dir.join(name);
         let exp = expected.clone();
         let needs = tokio::task::spawn_blocking(move || {
