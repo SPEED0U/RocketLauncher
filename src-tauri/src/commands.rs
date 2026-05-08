@@ -1845,9 +1845,39 @@ pub fn set_game_settings(settings: GameSettings) -> Result<(), String> {
     Ok(())
 }
 
+// Raw structure of the remote latest.json (new multi-platform format)
+#[derive(Debug, Clone, Deserialize)]
+struct UpdatePlatformWindows {
+    exe: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpdatePlatformLinux {
+    appimage: Option<String>,
+    deb: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpdatePlatforms {
+    windows: Option<UpdatePlatformWindows>,
+    linux: Option<UpdatePlatformLinux>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LatestJsonRemote {
+    version: String,
+    platforms: UpdatePlatforms,
+    #[serde(rename = "publishDate")]
+    publish_date: String,
+    #[serde(rename = "productName")]
+    product_name: String,
+}
+
+// Public struct returned to the frontend — interface unchanged
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub version: String,
+    /// OS-specific artifact filename (.exe on Windows, .AppImage on Linux)
     pub exe: String,
     #[serde(rename = "publishDate")]
     pub publish_date: String,
@@ -1859,39 +1889,57 @@ pub struct UpdateInfo {
 pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     const UPDATE_URL: &str = "https://rocket.nightriderz.world/latest.json";
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-    
+
     let response = client
         .get(UPDATE_URL)
         .send()
         .await
         .map_err(|e| format!("Failed to fetch update info: {}", e))?;
-    
+
     if !response.status().is_success() {
         return Err(format!("Server returned error: {}", response.status()));
     }
-    
-    let update_info: UpdateInfo = response
+
+    let raw: LatestJsonRemote = response
         .json()
         .await
         .map_err(|e| format!("Failed to parse update info: {}", e))?;
-    
-    
+
+    // Pick the artifact for the platform we are currently running on
+    #[cfg(target_os = "windows")]
+    let artifact: Option<String> = raw.platforms.windows.map(|p| p.exe);
+
+    #[cfg(target_os = "linux")]
+    let artifact: Option<String> = raw.platforms.linux.and_then(|p| p.appimage.or(p.deb));
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let artifact: Option<String> = None;
+
+    let artifact = match artifact {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+
     fn parse_semver(v: &str) -> (u32, u32, u32) {
         let parts: Vec<u32> = v.split('.').map(|p| p.parse().unwrap_or(0)).collect();
         (parts.get(0).copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0), parts.get(2).copied().unwrap_or(0))
     }
 
-    let remote = parse_semver(&update_info.version);
+    let remote = parse_semver(&raw.version);
     let current = parse_semver(CURRENT_VERSION);
 
     if remote > current {
-        Ok(Some(update_info))
+        Ok(Some(UpdateInfo {
+            version: raw.version,
+            exe: artifact,
+            publish_date: raw.publish_date,
+            product_name: raw.product_name,
+        }))
     } else {
         Ok(None)
     }
@@ -1937,22 +1985,51 @@ pub async fn download_update(exe_name: String) -> Result<String, String> {
 
 #[command]
 pub async fn install_update(installer_path: String) -> Result<(), String> {
-    
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        
+
         Command::new(&installer_path)
             .spawn()
             .map_err(|e| format!("Failed to launch installer: {}", e))?;
-        
-        
+
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(1));
             std::process::exit(0);
         });
     }
-    
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Determine the path of the currently running AppImage
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Cannot determine current executable path: {}", e))?;
+
+        // Make the downloaded AppImage executable
+        let metadata = std::fs::metadata(&installer_path)
+            .map_err(|e| format!("Cannot stat installer: {}", e))?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        std::fs::set_permissions(&installer_path, perms)
+            .map_err(|e| format!("Cannot chmod installer: {}", e))?;
+
+        // Replace the current executable with the new AppImage
+        std::fs::copy(&installer_path, &current_exe)
+            .map_err(|e| format!("Failed to replace current AppImage: {}", e))?;
+
+        // Relaunch from the updated executable and exit
+        std::process::Command::new(&current_exe)
+            .spawn()
+            .map_err(|e| format!("Failed to relaunch updated AppImage: {}", e))?;
+
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::process::exit(0);
+        });
+    }
+
     Ok(())
 }
 

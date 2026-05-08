@@ -38,6 +38,7 @@ export default function RootLayout({
     >
       <head>
         <style dangerouslySetInnerHTML={{ __html: "html,body{background:#09090b!important}" }} />
+        <script dangerouslySetInnerHTML={{ __html: `(function(){var dw=1280,dh=720,w=window.innerWidth,h=window.innerHeight;if(w<dw||h<dh){var s=Math.min(w/dw,h/dh),el=document.documentElement;el.style.width=dw+'px';el.style.height=dh+'px';el.style.transform='scale('+s+')';el.style.transformOrigin='top left';el.style.overflow='hidden';}})();` }} />
       </head>
       <body className="h-screen flex overflow-hidden" style={{ backgroundColor: "#09090b" }}>{children}</body>
     </html>

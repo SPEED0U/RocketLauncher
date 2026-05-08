@@ -106,18 +106,23 @@ export function BackgroundSlideshow({ disabled }: { disabled?: boolean }) {
       if (disabledRef.current || gameRunningRef.current) return;
       const nextSlide = generateSlideAnimation(nextImageIndex, animKey);
       
-      if (showA) {
-        setSlideB(nextSlide);
-      } else {
-        setSlideA(nextSlide);
-      }
-      
-      setTimeout(() => {
-        setShowA(!showA);
-      }, 50);
-      
-      setNextImageIndex((nextImageIndex + 1) % SLIDESHOW_IMAGES.length);
-      setAnimKey(prev => prev + 1);
+      // Preload the next image before starting the crossfade
+      const img = new window.Image();
+      const doSwitch = () => {
+        if (showA) {
+          setSlideB(nextSlide);
+        } else {
+          setSlideA(nextSlide);
+        }
+        setTimeout(() => {
+          setShowA(!showA);
+        }, 50);
+        setNextImageIndex((nextImageIndex + 1) % SLIDESHOW_IMAGES.length);
+        setAnimKey(prev => prev + 1);
+      };
+      img.onload = doSwitch;
+      img.onerror = doSwitch;
+      img.src = SLIDESHOW_IMAGES[nextImageIndex];
     }, DURATION_MS);
 
     return () => clearInterval(interval);

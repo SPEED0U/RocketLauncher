@@ -23,3 +23,5 @@ yarn-error.log*
 next-env.d.ts
 package-lock.json
 src-tauri/Cargo.lock
+/dist
+/scripts/_linux-build.sh

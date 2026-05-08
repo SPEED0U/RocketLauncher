@@ -30,6 +30,20 @@ pub fn run() {
                 let icon = tauri::image::Image::from_bytes(icon_bytes)
                     .expect("failed to load icon");
                 let _ = window.set_icon(icon);
+
+                // Adapt window size if screen resolution is below 1920x1080
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let screen_phys = monitor.size();
+                    let scale = monitor.scale_factor();
+                    let screen_w = (screen_phys.width as f64 / scale) as u32;
+                    let screen_h = (screen_phys.height as f64 / scale) as u32;
+
+                    if screen_w < 1920 || screen_h < 1080 {
+                        let new_w = (1280.0_f64 * 0.85).floor() as u32; // 1088
+                        let new_h = (720.0_f64 * 0.85).floor() as u32;  // 612
+                        let _ = window.set_size(tauri::LogicalSize::new(new_w, new_h));
+                    }
+                }
             }
 
             if cfg!(debug_assertions) {
