@@ -15,6 +15,12 @@ use std::process::Command;
 static HWID: OnceLock<String> = OnceLock::new();
 static HIDDEN_HWID: OnceLock<String> = OnceLock::new();
 
+/// Becomes `true` the moment a new game launch begins.
+/// The background cleanup retry thread checks this flag and stops immediately
+/// so it never touches the freshly-installed mods of the next server.
+static CANCEL_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[command]
 pub fn show_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
@@ -419,6 +425,10 @@ pub async fn launch_game(
         format!("http://127.0.0.1:{}{}", port, path)
     };
 
+    // Signal any background cleanup thread from the previous session to stop
+    // immediately — it must not delete the mods we are about to install.
+    CANCEL_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
+
     let display_name = if server_name.trim().is_empty() { server_id.clone() } else { server_name.clone() };
     crate::game_state::set_server_name(&display_name);
 
@@ -561,13 +571,33 @@ pub async fn launch_game(
         #[cfg(windows)]
         drop(guarded_child);
 
-        let _ = crate::downloader::clean_mods(game_path_for_exit);
-
         if exit_code != 0 {
             let _ = app_for_exit.emit("game-crashed", exit_code);
         }
         let _ = app_for_exit.emit("game-exited", exit_code);
+
+        if !close_on_exit_flag {
+            let cleanup_path = game_path_for_exit.clone();
+            // Reset the flag so this new cleanup thread is allowed to run.
+            CANCEL_CLEANUP.store(false, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                for _ in 0..12u32 {
+                    if CANCEL_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = crate::downloader::clean_mods(cleanup_path.clone());
+                    let still_pending = crate::downloader::has_pending_mod_cleanup(cleanup_path.clone())
+                        .unwrap_or(false);
+                    if !still_pending {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            });
+        }
+
         if close_on_exit_flag {
+            let _ = crate::downloader::clean_mods(game_path_for_exit);
             if let Some(win) = app_for_exit.get_webview_window("main") {
                 let _ = win.close();
             }
@@ -612,6 +642,10 @@ pub fn remove_server_mods(game_path: String) -> Result<(), String> {
     let data_dir = game_dir.join(".data");
     
     let mut errors = Vec::new();
+
+    if let Err(e) = crate::downloader::clean_mods(game_path.clone()) {
+        errors.push(format!("Cleanup links failed: {}", e));
+    }
     
     if mods_dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&mods_dir) {

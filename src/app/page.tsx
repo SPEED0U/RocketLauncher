@@ -15,7 +15,7 @@ import { UpdatePopup } from "@/components/screens/UpdatePopup";
 import { BackgroundSlideshow } from "@/components/ui/BackgroundSlideshow";
 import { RocketLaunchOverlay } from "@/components/ui/RocketLaunchOverlay";
 import { useDiscordRPC } from "@/lib/useDiscordRPC";
-import { cleanMods } from "@/lib/tauri-api";
+import { checkProcessRunning, cleanMods } from "@/lib/tauri-api";
 
 function ContentPanel() {
   const { currentPage, setPage } = useLauncherStore();
@@ -79,10 +79,34 @@ export default function Home() {
 
   const cleanedRef = useRef(false);
   useEffect(() => {
-    if (settings.installationDirectory && !cleanedRef.current) {
+    if (!settings.installationDirectory || cleanedRef.current) return;
+
+    let cancelled = false;
+    const installDir = settings.installationDirectory;
+
+    const tryCleanup = async () => {
+      if (cancelled || cleanedRef.current) return;
+
+      const isRunning = await checkProcessRunning("nfsw.exe").catch(() => false);
+      if (cancelled || cleanedRef.current) return;
+
+      // Avoid touching active mod links while the game process is still alive.
+      if (isRunning) {
+        setTimeout(() => {
+          void tryCleanup();
+        }, 2000);
+        return;
+      }
+
       cleanedRef.current = true;
-      cleanMods(settings.installationDirectory).catch(() => {});
-    }
+      await cleanMods(installDir).catch(() => {});
+    };
+
+    void tryCleanup();
+
+    return () => {
+      cancelled = true;
+    };
   }, [settings.installationDirectory]);
   useEffect(() => {
     if (process.env.NODE_ENV !== "production") return;

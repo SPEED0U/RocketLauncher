@@ -1062,6 +1062,246 @@ fn sha1_hex_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn materialize_mod_data_dir(
+    cache_dir: &Path,
+    data_dir: &Path,
+    entries: &[ModListEntry],
+) -> Result<(), String> {
+    if data_dir.exists() {
+        std::fs::remove_dir_all(data_dir)
+            .map_err(|e| format!("Failed to reset {}: {}", data_dir.display(), e))?;
+    }
+
+    for entry in entries {
+        let Some(name) = entry.name.as_ref().filter(|name| !name.trim().is_empty()) else {
+            continue;
+        };
+
+        let relative_path = Path::new(name);
+        let source_path = cache_dir.join(relative_path);
+        if !source_path.exists() {
+            return Err(format!("Missing cached mod file: {}", source_path.display()));
+        }
+
+        let target_path = data_dir.join(relative_path);
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+        }
+
+        match std::fs::hard_link(&source_path, &target_path) {
+            Ok(_) => {}
+            Err(_) => {
+                std::fs::copy(&source_path, &target_path)
+                    .map_err(|e| format!("Failed to materialize {}: {}", target_path.display(), e))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_path_safely(path: &Path) {
+    // For NTFS junctions on Windows, remove_dir is the correct call.
+    // We try all three methods in order so we never silently fail regardless
+    // of whether the path is a junction, a symlink, or a plain file/dir.
+    if std::fs::remove_dir(path).is_ok() {
+        return;
+    }
+    if std::fs::remove_file(path).is_ok() {
+        return;
+    }
+    std::fs::remove_dir_all(path).ok();
+}
+
+fn normalize_link_target(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(stripped) = raw.strip_prefix("\\\\?\\") {
+        PathBuf::from(stripped)
+    } else {
+        PathBuf::from(raw.as_ref())
+    }
+}
+
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn resolves_into_mod_runtime(path: &Path, base_dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
+    let Some(target) = std::fs::read_link(path)
+        .ok()
+        .map(normalize_link_target)
+        .map(|target| {
+            if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or(base_dir).join(target)
+            }
+        }) else {
+        return false;
+    };
+
+    target.starts_with(mods_dir) || target.starts_with(data_root_dir)
+}
+
+fn is_runtime_reparse_point(path: &Path, base_dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_reparse_point(&meta) => {
+            resolves_into_mod_runtime(path, base_dir, mods_dir, data_root_dir)
+                || (!path.starts_with(mods_dir) && !path.starts_with(data_root_dir))
+        }
+        _ => false,
+    }
+}
+
+fn has_runtime_mod_links(dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.starts_with(mods_dir) || path.starts_with(data_root_dir) {
+            continue;
+        }
+
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if is_reparse_point(&meta) {
+            if is_runtime_reparse_point(&path, dir, mods_dir, data_root_dir) {
+                return true;
+            }
+            continue;
+        }
+
+        if meta.is_dir() && has_runtime_mod_links(&path, mods_dir, data_root_dir) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_orig_files_outside_runtime(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+
+        if meta.is_dir() {
+            let skip_dir = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| matches!(name, "MODS" | ".data"))
+                .unwrap_or(false);
+            if skip_dir || is_reparse_point(&meta) {
+                continue;
+            }
+            if has_orig_files_outside_runtime(&path) {
+                return true;
+            }
+            continue;
+        }
+
+        if path.extension().and_then(|e| e.to_str()) == Some("orig") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn remove_runtime_mod_links(dir: &Path, mods_dir: &Path, data_root_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.starts_with(mods_dir) || path.starts_with(data_root_dir) {
+            continue;
+        }
+
+        // read_link succeeds for both symlinks AND NTFS junctions on Windows.
+        // If it succeeds, this entry is a link — remove it unconditionally.
+        if std::fs::read_link(&path).is_ok() {
+            remove_path_safely(&path);
+            continue;
+        }
+
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+
+        // Fallback: also catch reparse points that read_link might miss.
+        if is_reparse_point(&meta) {
+            remove_path_safely(&path);
+            continue;
+        }
+
+        if meta.is_dir() {
+            remove_runtime_mod_links(&path, mods_dir, data_root_dir);
+        }
+    }
+}
+
+fn prune_runtime_cache_orig_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+
+        if meta.is_dir() {
+            if is_reparse_point(&meta) {
+                remove_path_safely(&path);
+                continue;
+            }
+            prune_runtime_cache_orig_files(&path);
+            continue;
+        }
+
+        if path.extension().and_then(|e| e.to_str()) == Some("orig") {
+            std::fs::remove_file(&path).ok();
+        }
+    }
+}
+
+#[command]
+pub fn has_pending_mod_cleanup(game_path: String) -> Result<bool, String> {
+    let game_dir = PathBuf::from(&game_path);
+    if !game_dir.exists() {
+        return Ok(false);
+    }
+
+    let mods_dir = game_dir.join("MODS");
+    let data_root_dir = game_dir.join(".data");
+    let modules_dir = game_dir.join("modules");
+    let links_file = game_dir.join(".links");
+    let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
+
+    if links_file.exists() || modules_dir.exists() {
+        return Ok(true);
+    }
+
+    if artifacts.iter().any(|artifact| game_dir.join(artifact).exists()) {
+        return Ok(true);
+    }
+
+    if has_orig_files_outside_runtime(&game_dir) {
+        return Ok(true);
+    }
+
+    Ok(has_runtime_mod_links(&game_dir, &mods_dir, &data_root_dir))
+}
+
 #[command]
 pub async fn fetch_mod_info(server_ip: String) -> Result<Option<ModInfo>, String> {
     let client = build_cdn_client()?;
@@ -1119,6 +1359,7 @@ pub async fn download_mods(
         format!("{:x}", h.finalize())
     };
     let cache_dir = game_dir.join("MODS").join(&server_hash);
+    let data_dir = game_dir.join(".data").join(&server_hash);
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
 
     let total_mods = entries.len() as u32;
@@ -1170,6 +1411,7 @@ pub async fn download_mods(
     }
 
     if mods_to_download.is_empty() {
+        materialize_mod_data_dir(&cache_dir, &data_dir, &entries)?;
         return Ok(());
     }
 
@@ -1278,11 +1520,12 @@ pub async fn download_mods(
     }
 
     if any_mismatch {
-        let data_dir = game_dir.join(".data").join(&server_hash);
         if data_dir.exists() {
             std::fs::remove_dir_all(&data_dir).ok();
         }
     }
+
+    materialize_mod_data_dir(&cache_dir, &data_dir, &entries)?;
 
     let _ = app.emit("download-progress", DownloadEvent {
         status: "completed".into(),
@@ -1296,84 +1539,186 @@ pub async fn download_mods(
 }
 
 
+/// Prevents two concurrent cleanup calls from racing on the same files.
+/// Race condition scenario: background retry thread + explicit cleanMods call from
+/// handlePlay run simultaneously, causing one thread to delete a file the other
+/// just restored as "original".
+static CLEAN_MODS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[command]
 pub fn clean_mods(game_path: String) -> Result<(), String> {
-    let game_dir = PathBuf::from(&game_path);
-    let links_file = game_dir.join(".links");
+    fn clean_mods_once(game_path: &str) {
+        use rayon::prelude::*;
 
-    if links_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&links_file) {
+        let game_dir = PathBuf::from(game_path);
+        let links_file = game_dir.join(".links");
+        let mods_dir = game_dir.join("MODS");
+        let data_root_dir = game_dir.join(".data");
+
+        // Read and parse .links once — split into type-0 and type-1 lists.
+        let (junctions, file_links): (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) = {
+            let content = if links_file.exists() {
+                std::fs::read_to_string(&links_file).unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let mut junctions = Vec::new();
+            let mut file_links = Vec::new();
+
             for line in content.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() < 2 {
+                let mut parts = line.splitn(2, '\t');
+                let path_str = match parts.next() { Some(s) => s, None => continue };
+                let kind = match parts.next() { Some(s) => s.trim(), None => continue };
+
+                let full = if std::path::Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    game_dir.join(path_str)
+                };
+
+                if full.starts_with(&mods_dir) || full.starts_with(&data_root_dir) {
                     continue;
                 }
-                let loc = parts[0];
-                let link_type: i32 = parts[1].parse().unwrap_or(-1);
 
-                let real_loc = if std::path::Path::new(loc).is_absolute() {
-                    PathBuf::from(loc)
-                } else {
-                    game_dir.join(loc)
-                };
-                let orig_path = {
-                    let mut p = real_loc.as_os_str().to_os_string();
-                    p.push(".orig");
-                    PathBuf::from(p)
-                };
-
-                if link_type == 0 {
-                    if real_loc.exists() || real_loc.symlink_metadata().is_ok() {
-                        std::fs::remove_file(&real_loc).ok();
+                match kind {
+                    "1" => junctions.push(full),
+                    "0" => {
+                        let orig = {
+                            let mut s = full.as_os_str().to_os_string();
+                            s.push(".orig");
+                            PathBuf::from(s)
+                        };
+                        file_links.push((full, orig));
                     }
-                    if orig_path.exists() {
-                        std::fs::rename(&orig_path, &real_loc).ok();
-                    }
-                } else if link_type == 1 {
-                    if real_loc.exists() {
-                        std::fs::remove_dir_all(&real_loc).ok();
-                    }
+                    _ => {}
                 }
             }
-        }
+            (junctions, file_links)
+        };
+
+        // ── Step 1: remove directory junctions in parallel ─────────────────
+        // remove_dir() removes only the junction point (not the target contents).
+        // Then restore the .orig backup directory if one exists.
+        junctions.par_iter().for_each(|junction| {
+            if std::fs::remove_dir(junction).is_err() {
+                remove_path_safely(junction);
+            }
+            // Restore original directory backup if ModNet created one.
+            let orig_dir = {
+                let mut s = junction.as_os_str().to_os_string();
+                s.push(".orig");
+                PathBuf::from(s)
+            };
+            if let Ok(m) = std::fs::symlink_metadata(&orig_dir) {
+                if m.is_dir() && !is_reparse_point(&m) {
+                    std::fs::rename(&orig_dir, junction).ok();
+                }
+            }
+        });
+
+        // Also remove any junctions not listed in .links.
+        remove_runtime_mod_links(&game_dir, &mods_dir, &data_root_dir);
+
+        // ── Step 2: restore file backups in parallel ───────────────────────
+        // Remove mod file, rename <file>.orig → <file>.
+        file_links.par_iter().for_each(|(file_path, orig_path)| {
+            if file_path.exists() || file_path.symlink_metadata().is_ok() {
+                std::fs::remove_file(file_path).ok();
+            }
+            if orig_path.exists() {
+                std::fs::rename(orig_path, file_path).ok();
+            }
+        });
+
+        // Remove the .links file now that we've processed it.
         std::fs::remove_file(&links_file).ok();
-    }
 
-    fn restore_orig_files(dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                restore_orig_files(&path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) == Some("orig") {
-                let mut original = path.clone();
-                original.set_extension("");
-                if original.exists() || original.symlink_metadata().is_ok() {
-                    std::fs::remove_file(&original).ok();
+        // ── Step 3: parallel safety-net scan for remaining .orig entries ────
+        fn restore_orig_files(dir: &std::path::Path) {
+            use rayon::prelude::*;
+
+            let entries: Vec<_> = match std::fs::read_dir(dir) {
+                Ok(rd) => rd.flatten().collect(),
+                Err(_) => return,
+            };
+
+            entries.par_iter().for_each(|entry| {
+                let path = entry.path();
+                let meta = match std::fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+
+                if is_reparse_point(&meta) {
+                    remove_path_safely(&path);
+                    return;
                 }
-                std::fs::rename(&path, &original).ok();
+
+                let is_orig = path.extension().and_then(|e| e.to_str()) == Some("orig");
+
+                if meta.is_dir() {
+                    if is_orig {
+                        let mut original = path.clone();
+                        original.set_extension("");
+                        if original.exists() || original.symlink_metadata().is_ok() {
+                            remove_path_safely(&original);
+                        }
+                        std::fs::rename(&path, &original).ok();
+                    } else {
+                        let skip = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| matches!(n, "MODS" | ".data"))
+                            .unwrap_or(false);
+                        if !skip {
+                            restore_orig_files(&path);
+                        }
+                    }
+                    return;
+                }
+
+                if is_orig {
+                    let mut original = path.clone();
+                    original.set_extension("");
+                    if original.exists() || original.symlink_metadata().is_ok() {
+                        std::fs::remove_file(&original).ok();
+                    }
+                    std::fs::rename(&path, &original).ok();
+                }
+            });
+        }
+
+        restore_orig_files(&game_dir);
+
+        if mods_dir.exists() {
+            prune_runtime_cache_orig_files(&mods_dir);
+        }
+        if data_root_dir.exists() {
+            prune_runtime_cache_orig_files(&data_root_dir);
+        }
+
+        let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
+        for artifact in &artifacts {
+            let p = game_dir.join(artifact);
+            if p.exists() {
+                std::fs::remove_file(&p).ok();
             }
         }
-    }
-    restore_orig_files(&game_dir);
 
-    let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
-    for artifact in &artifacts {
-        let p = game_dir.join(artifact);
-        if p.exists() {
-            std::fs::remove_file(&p).ok();
+        let modules_dir = game_dir.join("modules");
+        if modules_dir.exists() {
+            std::fs::remove_dir_all(&modules_dir).ok();
         }
+
+        std::fs::create_dir_all(game_dir.join("scripts")).ok();
     }
 
-    let modules_dir = game_dir.join("modules");
-    if modules_dir.exists() {
-        std::fs::remove_dir_all(&modules_dir).ok();
-    }
-
-    std::fs::create_dir_all(game_dir.join("scripts")).ok();
-
+    // Hold the lock for the entire cleanup — prevents a concurrent call
+    // (background retry thread vs. explicit handlePlay cleanup) from racing
+    // on the same files and corrupting them.
+    let _guard = CLEAN_MODS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clean_mods_once(&game_path);
     Ok(())
 }
 

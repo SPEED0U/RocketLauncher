@@ -82,9 +82,7 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
       if (cancelled) return;
       const isRunning = await checkProcessRunning("nfsw.exe");
       if (!isRunning && !cancelled) {
-        if (settings.installationDirectory) {
-          await cleanMods(settings.installationDirectory).catch(() => {});
-        }
+        await cleanupInstalledMods();
         setGameStatus("idle");
       }
     }, 2000);
@@ -94,6 +92,11 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
       clearInterval(checkInterval);
     };
   }, [gameStatus, setGameStatus, settings.installationDirectory]);
+
+  async function cleanupInstalledMods() {
+    if (!settings.installationDirectory) return;
+    await cleanMods(settings.installationDirectory).catch(() => {});
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -202,31 +205,37 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
       let crashed = false;
 
       const unlistenExit = await listen("game-exited", () => {
-        if (sessionStart !== null) {
-          const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
-          if (elapsed > 0) addSeconds(capturedServerId, elapsed);
-          sessionStart = null;
-        }
-        if (!crashed) {
-          setGameStatus("idle");
-          logout();
-        }
-        unlistenExit();
+        void (async () => {
+          if (sessionStart !== null) {
+            const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
+            if (elapsed > 0) addSeconds(capturedServerId, elapsed);
+            sessionStart = null;
+          }
+          if (!crashed) {
+            setGameStatus("idle");
+            logout();
+          }
+          void cleanupInstalledMods();
+          unlistenExit();
+        })();
       });
 
       const unlistenCrash = await listen("game-crashed", () => {
-        crashed = true;
-        if (sessionStart !== null) {
-          const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
-          if (elapsed > 0) addSeconds(capturedServerId, elapsed);
-          sessionStart = null;
-        }
-        setError("The game crashed. You have been signed out — mod files have been cleaned.");
-        setTimeout(() => {
-          setGameStatus("idle");
-          setTimeout(() => logout(), 300);
-        }, 600);
-        unlistenCrash();
+        void (async () => {
+          crashed = true;
+          if (sessionStart !== null) {
+            const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
+            if (elapsed > 0) addSeconds(capturedServerId, elapsed);
+            sessionStart = null;
+          }
+          setError("The game crashed. You have been signed out — mod files have been cleaned.");
+          void cleanupInstalledMods();
+          setTimeout(() => {
+            setGameStatus("idle");
+            setTimeout(() => logout(), 300);
+          }, 600);
+          unlistenCrash();
+        })();
       });
 
       sessionStart = Date.now();

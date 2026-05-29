@@ -436,6 +436,10 @@ export async function downloadMods(
   return invoke("download_mods", { basePath, serverId, gamePath });
 }
 
+export async function hasPendingModCleanup(gamePath: string): Promise<boolean> {
+  return invoke<boolean>("has_pending_mod_cleanup", { gamePath });
+}
+
 export async function cleanMods(gamePath: string): Promise<void> {
   return invoke("clean_mods", { gamePath });
 }

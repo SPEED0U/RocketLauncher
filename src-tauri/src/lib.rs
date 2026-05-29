@@ -101,6 +101,7 @@ pub fn run() {
             downloader::download_modnet_modules,
             downloader::fetch_mod_info,
             downloader::download_mods,
+            downloader::has_pending_mod_cleanup,
             downloader::clean_mods,
             downloader::fetch_cdn_list,
             discord_rpc::discord_rpc_init,
