@@ -53,6 +53,8 @@ export function MainScreen() {
   const [showDownloadError, setShowDownloadError] = useState(false);
   const downloadErrorRef = useRef<string | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  const maxDownloadPercentRef = useRef(0);
+  const prevDownloadStatusRef = useRef<string>("idle");
 
   const [autoVerifyStatus, setAutoVerifyStatus] = useState<"idle" | "verifying" | "repairing" | "done" | "error">("idle");
   const [autoVerifyMessage, setAutoVerifyMessage] = useState("");
@@ -178,11 +180,8 @@ export function MainScreen() {
 
       const el = contentRef.current;
 
-      const onTransitionEnd = (e: TransitionEvent) => {
-        if (e.propertyName !== "opacity" || e.target !== el) return;
-        el?.removeEventListener("transitionend", onTransitionEnd);
+      const handleFadeOutComplete = () => {
         fadeOutDoneRef.current = true;
-
         if (pendingRevealRef.current) {
           doReveal(pendingRevealRef.current.server, pendingRevealRef.current.details);
         } else {
@@ -192,11 +191,29 @@ export function MainScreen() {
         }
       };
 
+      // Fallback in case transitionend never fires (WebView2 GPU compositing issues on
+      // integrated GPUs with disabled write-back cache / hardware acceleration).
+      // 600ms = 400ms transition duration + 200ms safety buffer.
+      const transitionFallbackTimer = setTimeout(() => {
+        if (!fadeOutDoneRef.current) {
+          el?.removeEventListener("transitionend", onTransitionEnd);
+          handleFadeOutComplete();
+        }
+      }, 600);
+
+      const onTransitionEnd = (e: TransitionEvent) => {
+        if (e.propertyName !== "opacity" || e.target !== el) return;
+        clearTimeout(transitionFallbackTimer);
+        el?.removeEventListener("transitionend", onTransitionEnd);
+        handleFadeOutComplete();
+      };
+
       if (el) el.addEventListener("transitionend", onTransitionEnd);
       setContentVisible(false);
 
       return () => {
         el?.removeEventListener("transitionend", onTransitionEnd);
+        clearTimeout(transitionFallbackTimer);
         if (revealFallbackRef.current) clearTimeout(revealFallbackRef.current);
         isTransitioning.current = false;
         fadeOutDoneRef.current = false;
@@ -374,12 +391,36 @@ export function MainScreen() {
     }
   }, [downloadError, isDownloading]);
 
-  const downloadPercent =
-    downloadProgress.totalBytes > 0
-      ? (downloadProgress.downloadedBytes / downloadProgress.totalBytes) * 100
-      : downloadProgress.totalFiles > 0
-        ? (downloadProgress.currentFile / downloadProgress.totalFiles) * 100
-        : 0;
+  const rawDownloadPercent = Math.min(
+    100,
+    Math.max(
+      0,
+      downloadProgress.totalBytes > 0
+        ? (downloadProgress.downloadedBytes / downloadProgress.totalBytes) * 100
+        : downloadProgress.totalFiles > 0
+          ? (downloadProgress.currentFile / downloadProgress.totalFiles) * 100
+          : 0,
+    ),
+  );
+
+      const downloadPercent = isDownloading
+        ? Math.max(rawDownloadPercent, maxDownloadPercentRef.current)
+        : rawDownloadPercent;
+
+      useEffect(() => {
+        if (!isDownloading || downloadProgress.status === "completed" || downloadProgress.status === "idle" || downloadProgress.status === "error") {
+          maxDownloadPercentRef.current = 0;
+          prevDownloadStatusRef.current = downloadProgress.status;
+          return;
+        }
+        // Reset the ratchet on phase transitions (e.g., verifying → downloading)
+        // so that 100% from the verify phase doesn't lock the download phase at 100%.
+        if (prevDownloadStatusRef.current !== downloadProgress.status) {
+          maxDownloadPercentRef.current = 0;
+          prevDownloadStatusRef.current = downloadProgress.status;
+        }
+        maxDownloadPercentRef.current = Math.max(maxDownloadPercentRef.current, rawDownloadPercent);
+      }, [isDownloading, rawDownloadPercent, downloadProgress.status]);
 
   if (!selectedServer) {
     return (

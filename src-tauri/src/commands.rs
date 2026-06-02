@@ -429,6 +429,25 @@ pub async fn launch_game(
     // immediately — it must not delete the mods we are about to install.
     CANCEL_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
 
+    // Snapshot the current contents of scripts/ before the game (and its mod
+    // manager) can add new files — so clean_mods knows which files to keep.
+    {
+        let scripts_dir = game_dir.join("scripts");
+        let snapshot_path = game_dir.join(".scripts_snapshot");
+        let existing: Vec<String> = if scripts_dir.exists() {
+            std::fs::read_dir(&scripts_dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        std::fs::write(&snapshot_path, existing.join("\n")).ok();
+    }
+
     let display_name = if server_name.trim().is_empty() { server_id.clone() } else { server_name.clone() };
     crate::game_state::set_server_name(&display_name);
 

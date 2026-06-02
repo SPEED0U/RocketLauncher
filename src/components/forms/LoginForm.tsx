@@ -3,7 +3,7 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
-import { loginToServer, pickGameFolder, launchGame, fetchModInfo, downloadModNetModules, downloadMods, cleanMods, grantFolderPermissions, recoverPassword, checkFileExists, checkProcessRunning } from "@/lib/tauri-api";
+import { loginToServer, pickGameFolder, launchGame, fetchModInfo, downloadModNetModules, downloadMods, cleanMods, grantFolderPermissions, recoverPassword, checkFileExists, checkProcessRunning, hasPendingModCleanup } from "@/lib/tauri-api";
 import { isCloudDrivePath } from "@/lib/utils";
 import { URLS } from "@/lib/urls";
 import { useLauncherStore } from "@/stores/launcherStore";
@@ -95,6 +95,8 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
 
   async function cleanupInstalledMods() {
     if (!settings.installationDirectory) return;
+    const needsCleanup = await hasPendingModCleanup(settings.installationDirectory).catch(() => true);
+    if (!needsCleanup) return;
     await cleanMods(settings.installationDirectory).catch(() => {});
   }
 
@@ -206,6 +208,7 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
 
       const unlistenExit = await listen("game-exited", () => {
         void (async () => {
+          await cleanupInstalledMods();
           if (sessionStart !== null) {
             const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
             if (elapsed > 0) addSeconds(capturedServerId, elapsed);
@@ -215,7 +218,6 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
             setGameStatus("idle");
             logout();
           }
-          void cleanupInstalledMods();
           unlistenExit();
         })();
       });
@@ -223,13 +225,13 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
       const unlistenCrash = await listen("game-crashed", () => {
         void (async () => {
           crashed = true;
+          await cleanupInstalledMods();
           if (sessionStart !== null) {
             const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
             if (elapsed > 0) addSeconds(capturedServerId, elapsed);
             sessionStart = null;
           }
           setError("The game crashed. You have been signed out — mod files have been cleaned.");
-          void cleanupInstalledMods();
           setTimeout(() => {
             setGameStatus("idle");
             setTimeout(() => logout(), 300);

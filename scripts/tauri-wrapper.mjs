@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from 'child_process'; // spawnSync used for cargo update
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, copyFileSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, mkdirSync, copyFileSync, unlinkSync, rmSync } from 'fs';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
@@ -352,6 +352,29 @@ function createLatestJson(version, winExePath, linuxArtifacts) {
 }
 
 async function main() {
+  function cleanStaleTauriContextArtifacts() {
+    // Rarely, stale generated context files under target/*/build can become
+    // inconsistent and trigger a runtime panic in generate_context!().
+    // Clearing only rocket-launcher build-script outputs is enough and avoids
+    // a full cargo clean.
+    const profiles = ['debug', 'release'];
+    for (const profile of profiles) {
+      const buildDir = join(tauriDir, 'target', profile, 'build');
+      if (!existsSync(buildDir)) continue;
+
+      for (const entry of readdirSync(buildDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (!entry.name.startsWith('rocket-launcher-')) continue;
+        const full = join(buildDir, entry.name);
+        try {
+          rmSync(full, { recursive: true, force: true });
+        } catch {
+          // Best effort cleanup only.
+        }
+      }
+    }
+  }
+
   try {
     let version = null;
 
@@ -366,9 +389,11 @@ async function main() {
 
       updateVersion(version);
 
+      // Purge stale generated context to prevent sporadic JSON parse panics.
+      cleanStaleTauriContextArtifacts();
+
       // --- Windows build ---
       await runWindowsBuild(tauriArgs);
-
       // --- Linux build via WSL ---
       if (isWslAvailable()) {
         try {

@@ -15,7 +15,7 @@ import { UpdatePopup } from "@/components/screens/UpdatePopup";
 import { BackgroundSlideshow } from "@/components/ui/BackgroundSlideshow";
 import { RocketLaunchOverlay } from "@/components/ui/RocketLaunchOverlay";
 import { useDiscordRPC } from "@/lib/useDiscordRPC";
-import { checkProcessRunning, cleanMods } from "@/lib/tauri-api";
+import { checkProcessRunning, cleanMods, hasPendingModCleanup } from "@/lib/tauri-api";
 
 function ContentPanel() {
   const { currentPage, setPage } = useLauncherStore();
@@ -95,6 +95,14 @@ export default function Home() {
         setTimeout(() => {
           void tryCleanup();
         }, 2000);
+        return;
+      }
+
+      const needsCleanup = await hasPendingModCleanup(installDir).catch(() => true);
+      if (cancelled || cleanedRef.current) return;
+
+      if (!needsCleanup) {
+        cleanedRef.current = true;
         return;
       }
 
