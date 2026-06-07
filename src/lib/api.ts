@@ -61,10 +61,11 @@ export async function launchGame(
   userId: string,
   discordAppId?: string,
   closeOnExit?: boolean,
-  disableProxy?: boolean
+  disableProxy?: boolean,
+  serverCategory?: string
 ) {
   const tauri = await getTauriApi();
-  return tauri.launchGame(gamePath, serverId, serverName, serverIp, loginToken, userId, discordAppId, closeOnExit, disableProxy);
+  return tauri.launchGame(gamePath, serverId, serverName, serverIp, loginToken, userId, discordAppId, closeOnExit, disableProxy, serverCategory);
 }
 
 export async function checkFileExists(path: string) {

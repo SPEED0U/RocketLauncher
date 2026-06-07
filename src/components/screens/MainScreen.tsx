@@ -30,6 +30,7 @@ import {
   Server,
   Gamepad2,
   CheckCircle,
+  Loader2,
 } from "lucide-react";
 
 export function MainScreen() {
@@ -381,6 +382,10 @@ export function MainScreen() {
   }
 
   const isDownloading = downloadProgress.status === "downloading" || downloadProgress.status === "extracting" || downloadProgress.status === "verifying" || isDownloadActive;
+  const isVerifyInitializing =
+    downloadProgress.status === "verifying" &&
+    downloadProgress.currentFile === 0 &&
+    downloadProgress.totalFiles === 0;
 
   useEffect(() => {
     if (downloadError && !isDownloading) {
@@ -520,18 +525,19 @@ export function MainScreen() {
                     pointerEvents: isDownloading ? 'auto' : 'none',
                   }}
                 >
-                  <div className="bg-surface border border-border rounded-xl p-4 space-y-2 shadow-lg">
-                    <div className="flex items-center justify-between">
+                  <div className="bg-surface border border-border rounded-xl p-3 space-y-1.5 shadow-lg">
+                    <div className="flex items-center justify-between gap-3">
                       <h3 className="text-[10px] font-medium flex items-center gap-2">
                         <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                        {isVerifyInitializing && <Loader2 size={10} className="animate-spin text-primary/80" />}
                         {downloadProgress.status === "extracting"
                           ? "Extracting"
                           : downloadProgress.status === "verifying"
                           ? "Verifying"
                           : "Downloading"}
                       </h3>
-                      <span className="text-[9px] text-muted font-mono bg-surface-hover px-1.5 py-0.5 rounded">
-                        {downloadProgress.currentFile} / {downloadProgress.totalFiles}
+                      <span className="text-[9px] text-muted font-mono bg-surface-hover px-1.5 py-0.5 rounded whitespace-nowrap">
+                        ETA {formatETA(downloadProgress.eta || 0)}
                       </span>
                     </div>
 
@@ -546,19 +552,14 @@ export function MainScreen() {
                       size="sm"
                       showPercent={false}
                     />
-
-                    <div className="flex justify-between text-[9px] text-muted font-mono">
-                      <span>
-                        {downloadProgress.totalBytes > 0
-                          ? `${formatBytes(downloadProgress.downloadedBytes)} / ${formatBytes(downloadProgress.totalBytes)}`
-                          : formatBytes(downloadProgress.downloadedBytes)}
-                      </span>
-                      <span>ETA {formatETA(downloadProgress.eta || 0)}</span>
-                    </div>
-
-                    <p className="text-[9px] text-muted truncate">
-                      {downloadProgress.fileName}
+                    <p
+                      className={`text-[10px] font-mono truncate ${
+                        isVerifyInitializing ? "text-primary/80 animate-pulse" : "text-muted"
+                      }`}
+                    >
+                      {downloadProgress.fileName || (isVerifyInitializing ? "Initializing verification..." : "Preparing...")}
                     </p>
+
                   </div>
                 </div>
               </div>

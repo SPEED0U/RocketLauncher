@@ -1,6 +1,6 @@
 fn main() {
     // In release, embed the requireAdministrator manifest for UAC elevation.
-    // In debug/dev, use the default asInvoker manifest so cargo run works without UAC.
+    // In debug/dev, use the default asInvoker manifest so `tauri dev` can run.
     let profile = std::env::var("PROFILE").unwrap_or_default();
     if profile == "release" {
         let attrs = tauri_build::Attributes::new()

@@ -37,6 +37,7 @@ export interface ServerListEntry {
 export interface ServerDetails {
   serverName: string;
   serverVersion: string;
+  time?: number | string;
   homePageUrl: string;
   discordUrl: string;
   requireTicket: boolean;
@@ -124,6 +125,7 @@ export interface LauncherSettings {
   defenderStatus: "not_checked" | "excluded" | "not_excluded" | "error";
   closeOnGameExit: boolean;
   disableSlideshow: boolean;
+  permissionsGrantedFor: string;
 }
 
 export type LauncherPage =

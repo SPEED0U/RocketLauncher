@@ -37,12 +37,24 @@ export function RocketLaunchOverlay() {
       }}
     >
       <div className="flex flex-col items-center gap-6">
-        <Lottie
-          animationData={rocketAnimation}
-          loop
-          autoplay
-          style={{ width: 320, height: 320 }}
-        />
+        <div
+          className="relative w-[320px] h-[320px]"
+          style={{
+            WebkitMaskImage:
+              "linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%), linear-gradient(to top, transparent 0%, black 28%, black 100%)",
+            WebkitMaskComposite: "source-in",
+            maskImage:
+              "linear-gradient(to right, transparent 0%, black 18%, black 82%, transparent 100%), linear-gradient(to top, transparent 0%, black 28%, black 100%)",
+            maskComposite: "intersect",
+          }}
+        >
+          <Lottie
+            animationData={rocketAnimation}
+            loop
+            autoplay
+            style={{ width: 320, height: 320 }}
+          />
+        </div>
         <p className="text-white/50 text-[10px] font-mono tracking-[0.5em] uppercase animate-soft-pulse">
           Launching Game
         </p>

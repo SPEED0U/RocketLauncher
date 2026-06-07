@@ -27,23 +27,24 @@ export function useDiscordRPC() {
   const initialized = useRef(false);
   const wasInGame = useRef(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const isDevServer = selectedServer?.category?.toUpperCase() === "DEV";
 
   useEffect(() => {
     getVersion().then(setAppVersion).catch(() => setAppVersion(null));
   }, []);
 
   useEffect(() => {
-    if (settings.disableRPC) {
+    if (settings.disableRPC || isDevServer) {
       return;
     }
 
     discordRpcInit()
       .then(() => { initialized.current = true; })
       .catch(() => {});
-  }, [settings.disableRPC]);
+  }, [settings.disableRPC, isDevServer]);
 
   useEffect(() => {
-    if (settings.disableRPC || !initialized.current) return;
+    if (settings.disableRPC || isDevServer || !initialized.current) return;
 
     const update = async () => {
       if (gameStatus === "launching" || gameStatus === "running") {
@@ -79,5 +80,5 @@ export function useDiscordRPC() {
     };
 
     update();
-  }, [currentPage, gameStatus, isLoggedIn, selectedServer, settings.disableRPC, appVersion]);
+  }, [currentPage, gameStatus, isLoggedIn, selectedServer, settings.disableRPC, isDevServer, appVersion]);
 }

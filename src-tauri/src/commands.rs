@@ -12,6 +12,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 static HWID: OnceLock<String> = OnceLock::new();
 static HIDDEN_HWID: OnceLock<String> = OnceLock::new();
 
@@ -20,6 +23,239 @@ static HIDDEN_HWID: OnceLock<String> = OnceLock::new();
 /// so it never touches the freshly-installed mods of the next server.
 static CANCEL_CLEANUP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+fn has_server_icon(server_id: &str) -> bool {
+    matches!(
+        server_id.to_ascii_lowercase().as_str(),
+        "frss" | "nightriderz" | "nightriderz_dev" | "overdrive" | "ugstage" | "worldevolved" | "wugg"
+    )
+}
+
+fn server_list_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("GameLauncherReborn 2.2.4 (+https://github.com/SPEED0U/RocketLauncher)")
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build server list HTTP client")
+    })
+}
+
+fn latency_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("GameLauncherReborn 2.2.4 (+https://github.com/SPEED0U/RocketLauncher)")
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build latency HTTP client")
+    })
+}
+
+#[cfg(windows)]
+fn server_icon_bytes(server_id: &str) -> &'static [u8] {
+    match server_id.to_ascii_lowercase().as_str() {
+        "frss" => include_bytes!("../../src/imgs/srvicons/frss.webp"),
+        "nightriderz" | "nightriderz_dev" => include_bytes!("../../src/imgs/srvicons/nightriderz.webp"),
+        "overdrive" => include_bytes!("../../src/imgs/srvicons/overdrive.webp"),
+        "ugstage" => include_bytes!("../../src/imgs/srvicons/ugstage.webp"),
+        "worldevolved" => include_bytes!("../../src/imgs/srvicons/worldevolved.webp"),
+        "wugg" => include_bytes!("../../src/imgs/srvicons/wugg.webp"),
+        _ => include_bytes!("../icons/icon.png"),
+    }
+}
+
+#[cfg(windows)]
+fn server_icon_ico_path(server_id: &str, pid: u32) -> Result<std::path::PathBuf, String> {
+    use image::{imageops::FilterType, ImageFormat};
+
+    let image = image::load_from_memory(server_icon_bytes(server_id))
+        .map_err(|e| format!("Failed to decode server icon: {}", e))?;
+    let mut image = image.resize(256, 256, FilterType::Lanczos3).to_rgba8();
+
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let radius = (width.min(height) / 5).max(24);
+    let radius_sq = (radius * radius) as i32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let left = x < radius;
+            let right = x >= width - radius;
+            let top = y < radius;
+            let bottom = y >= height - radius;
+
+            let mut outside = false;
+            if left && top {
+                let dx = radius - 1 - x;
+                let dy = radius - 1 - y;
+                outside = dx * dx + dy * dy > radius_sq;
+            } else if right && top {
+                let dx = x - (width - radius);
+                let dy = radius - 1 - y;
+                outside = dx * dx + dy * dy > radius_sq;
+            } else if left && bottom {
+                let dx = radius - 1 - x;
+                let dy = y - (height - radius);
+                outside = dx * dx + dy * dy > radius_sq;
+            } else if right && bottom {
+                let dx = x - (width - radius);
+                let dy = y - (height - radius);
+                outside = dx * dx + dy * dy > radius_sq;
+            }
+
+            if outside {
+                image.get_pixel_mut(x as u32, y as u32)[3] = 0;
+            }
+        }
+    }
+
+    let temp_path = std::env::temp_dir().join(format!("rocket-launcher-{}-{}.ico", server_id, pid));
+    let mut file = std::fs::File::create(&temp_path)
+        .map_err(|e| format!("Failed to create temp icon file: {}", e))?;
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut file, ImageFormat::Ico)
+        .map_err(|e| format!("Failed to write temp icon file: {}", e))?;
+    Ok(temp_path)
+}
+
+#[cfg(windows)]
+fn find_windows_for_pid(pid: u32) -> Vec<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+
+    #[repr(C)]
+    struct Context {
+        pid: u32,
+        hwnds: Vec<HWND>,
+    }
+
+    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam as *mut Context);
+        let mut window_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut window_pid);
+        if window_pid == ctx.pid {
+            ctx.hwnds.push(hwnd);
+        }
+        1
+    }
+
+    let mut ctx = Context { pid, hwnds: Vec::new() };
+    unsafe {
+        EnumWindows(Some(enum_windows_proc), &mut ctx as *mut Context as isize);
+    }
+    ctx.hwnds
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        let _ = CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(windows)]
+fn load_server_icon_handle(icon_path: &std::path::Path) -> Option<isize> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
+    };
+
+    let wide: Vec<u16> = icon_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    unsafe {
+        let icon = LoadImageW(
+            0,
+            wide.as_ptr(),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        );
+        if icon == 0 {
+            None
+        } else {
+            Some(icon as isize)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn apply_server_icon_to_window(hwnd: windows_sys::Win32::Foundation::HWND, icon_value: isize) {
+    use windows_sys::Win32::Foundation::LPARAM;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, SetClassLongPtrW,
+        GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, WM_SETICON,
+    };
+
+    unsafe {
+        let _ = SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_value as LPARAM);
+        let _ = SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon_value as LPARAM);
+        let _ = SetClassLongPtrW(hwnd, GCLP_HICON, icon_value);
+        let _ = SetClassLongPtrW(hwnd, GCLP_HICONSM, icon_value);
+    }
+}
+
+#[cfg(windows)]
+fn set_game_window_icon_async(server_id: String, pid: u32) {
+    std::thread::spawn(move || {
+        let icon_path = match server_icon_ico_path(&server_id, pid) {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let icon_value = match load_server_icon_handle(&icon_path) {
+            Some(icon) => icon,
+            None => {
+                let _ = std::fs::remove_file(icon_path);
+                return;
+            }
+        };
+
+        let mut last_windows: Vec<windows_sys::Win32::Foundation::HWND> = Vec::new();
+        let started = std::time::Instant::now();
+        // Retry while process is alive (max 10 minutes safety cap) to handle
+        // slow startups and windows created late by launchers/overlays.
+        while process_is_alive(pid) && started.elapsed() < std::time::Duration::from_secs(600) {
+            let windows = find_windows_for_pid(pid);
+            if windows.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                continue;
+            }
+
+            for hwnd in &windows {
+                apply_server_icon_to_window(*hwnd, icon_value);
+            }
+
+            last_windows = windows;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+
+        for hwnd in last_windows {
+            apply_server_icon_to_window(hwnd, icon_value);
+        }
+
+        let _ = std::fs::remove_file(icon_path);
+    });
+}
 
 #[command]
 pub fn show_window(app: tauri::AppHandle) -> Result<(), String> {
@@ -168,12 +404,7 @@ pub async fn fetch_url(
 
 #[command]
 pub async fn fetch_server_list(api_url: String) -> Result<String, String> {
-    let ua = "GameLauncherReborn 2.2.4 (+https://github.com/SPEED0U/RocketLauncher)";
-    let client = reqwest::Client::builder()
-        .user_agent(ua)
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = server_list_client();
 
     let response = client
         .get(&format!("{}/serverlist.json", api_url))
@@ -185,20 +416,55 @@ pub async fn fetch_server_list(api_url: String) -> Result<String, String> {
 }
 
 #[command]
-pub async fn ping_server(server_ip: String) -> Result<i64, String> {
-    let base = server_ip.trim_end_matches('/');
-    let url = format!("{}/GetServerInformation", base);
+pub async fn measure_server_information_latency(server_ip: String) -> Result<i64, String> {
+    let url = format!("{}/GetServerInformation", server_ip.trim_end_matches('/'));
+    let x_ua = "GameLauncherReborn 2.2.4";
+    let client = latency_client();
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let mut samples: Vec<i64> = Vec::new();
 
-    match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => Ok(1),
-        _ => Ok(-1),
+    for _ in 0..3 {
+        let started_at = std::time::Instant::now();
+        let response = client
+            .get(&url)
+            .header("X-UserAgent", x_ua)
+            .header("X-GameLauncherHash", "1DF8911B158CD1DF88BF95AE21ABA20AA84B4AE6")
+            .header("X-HWID", get_hwid())
+            .header("X-HiddenHWID", get_hidden_hwid())
+            .header("X-GameLauncherCertificate", "")
+            .header("X-DiscordID", "")
+            .send()
+            .await;
+
+        let Ok(response) = response else {
+            continue;
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        // `send().await` completes when response headers are received, which
+        // approximates curl's time_starttransfer (TTFB) and ignores body
+        // transfer duration.
+        let elapsed = started_at.elapsed().as_millis() as i64;
+        samples.push(elapsed.max(1));
     }
+
+    if samples.is_empty() {
+        return Ok(-1);
+    }
+
+    samples.sort_unstable();
+    let low_count = samples.len().min(2) as i64;
+    let low_sum: i64 = samples.iter().take(low_count as usize).sum();
+    Ok((low_sum / low_count).max(1))
+}
+
+#[command]
+pub async fn ping_server(server_ip: String) -> Result<i64, String> {
+    // Use the HTTP TTFB-based method as the default ping strategy.
+    measure_server_information_latency(server_ip).await
 }
 
 static PROXY_HANDLE: std::sync::OnceLock<Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>> = std::sync::OnceLock::new();
@@ -381,6 +647,7 @@ pub async fn launch_game(
     server_id: String,
     server_name: String,
     server_ip: String,
+    server_category: Option<String>,
     login_token: String,
     user_id: String,
     discord_app_id: Option<String>,
@@ -397,6 +664,11 @@ pub async fn launch_game(
     if user_id == "undefined" || user_id.is_empty() {
         return Err(format!("Invalid user_id: '{}'. Please re-login.", user_id));
     }
+
+    let is_dev_server = server_category
+        .as_deref()
+        .map(|category| category.eq_ignore_ascii_case("DEV"))
+        .unwrap_or(false);
 
     let effective_ip = if disable_proxy {
         server_ip.clone()
@@ -432,43 +704,51 @@ pub async fn launch_game(
     // Snapshot the current contents of scripts/ before the game (and its mod
     // manager) can add new files — so clean_mods knows which files to keep.
     {
-        let scripts_dir = game_dir.join("scripts");
-        let snapshot_path = game_dir.join(".scripts_snapshot");
-        let existing: Vec<String> = if scripts_dir.exists() {
-            std::fs::read_dir(&scripts_dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.path().is_file())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        } else {
-            Vec::new()
-        };
-        std::fs::write(&snapshot_path, existing.join("\n")).ok();
+        let game_dir_for_snapshot = game_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let scripts_dir = game_dir_for_snapshot.join("scripts");
+            let snapshot_path = game_dir_for_snapshot.join(".scripts_snapshot");
+            let existing: Vec<String> = if scripts_dir.exists() {
+                std::fs::read_dir(&scripts_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            std::fs::write(&snapshot_path, existing.join("\n")).ok();
+        })
+        .await
+        .map_err(|e| format!("Failed to snapshot scripts directory: {}", e))?;
     }
 
     let display_name = if server_name.trim().is_empty() { server_id.clone() } else { server_name.clone() };
     crate::game_state::set_server_name(&display_name);
+    crate::game_state::set_rpc_enabled(!is_dev_server);
 
     let game_app_id = discord_app_id
         .as_ref()
         .filter(|s| !s.is_empty() && s.len() >= 15 && s.chars().all(|c| c.is_ascii_digit()))
         .cloned();
-    let _ = crate::discord_rpc::discord_rpc_reconnect(game_app_id.clone());
+    if !is_dev_server {
+        let _ = crate::discord_rpc::discord_rpc_reconnect(game_app_id.clone());
 
-    let _ = crate::discord_rpc::discord_rpc_update(
-        Some(display_name.clone()),
-        Some("Launching Game".to_string()),
-        Some("nfsw".to_string()),
-        Some("Need for Speed: World".to_string()),
-        Some("ingame".to_string()),
-        Some("In-Game".to_string()),
-        Some("Project Site".to_string()),
-        Some("https://soapboxrace.world".to_string()),
-        None,
-        None,
-    );
+        let _ = crate::discord_rpc::discord_rpc_update(
+            Some(display_name.clone()),
+            Some("Launching Game".to_string()),
+            Some("nfsw".to_string()),
+            Some("Need for Speed: World".to_string()),
+            Some("ingame".to_string()),
+            Some("In-Game".to_string()),
+            Some("Project Site".to_string()),
+            Some("https://soapboxrace.world".to_string()),
+            None,
+            None,
+        );
+    }
 
     #[cfg(windows)]
     let guarded_child = {
@@ -540,6 +820,19 @@ pub async fn launch_game(
         None
     };
 
+    #[cfg(windows)]
+    {
+        let pid = guarded_child
+            .as_ref()
+            .map(|child| unsafe { windows_sys::Win32::System::Threading::GetProcessId(child.process_handle()) })
+            .or_else(|| child_plain.as_ref().map(|child| child.id()))
+            .unwrap_or(0);
+
+        if pid != 0 && has_server_icon(&server_id) {
+            set_game_window_icon_async(server_id.clone(), pid);
+        }
+    }
+
     #[cfg(not(windows))]
     let child_plain = Some(
         std::process::Command::new("wine")
@@ -604,9 +897,8 @@ pub async fn launch_game(
                     if CANCEL_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
-                    let _ = crate::downloader::clean_mods(cleanup_path.clone());
-                    let still_pending = crate::downloader::has_pending_mod_cleanup(cleanup_path.clone())
-                        .unwrap_or(false);
+                    let still_pending = crate::downloader::clean_mods_and_check_pending(&cleanup_path)
+                        .unwrap_or(true);
                     if !still_pending {
                         break;
                     }
@@ -788,10 +1080,13 @@ fn get_gpu_info() -> (String, String) {
     use std::os::windows::process::CommandExt;
     const NO_WINDOW: u32 = 0x08000000;
 
+    // Use Get-CimInstance instead of Get-WmiObject: it is significantly faster
+    // and does not rely on the WMI service which can stall for 10–30 s on some
+    // machines. Cap the whole call at 5 s to prevent startup hangs.
     let output = Command::new("powershell")
         .args([
             "-NoProfile", "-NonInteractive", "-Command",
-            "Get-WmiObject Win32_VideoController | Select-Object -First 1 Name,DriverVersion | ConvertTo-Json"
+            "Get-CimInstance Win32_VideoController | Select-Object -First 1 Name,DriverVersion | ConvertTo-Json"
         ])
         .creation_flags(NO_WINDOW)
         .output();
@@ -823,85 +1118,98 @@ fn get_gpu_info() -> (String, String) {
 }
 
 #[command]
-pub fn get_system_info() -> Result<SystemInfo, String> {
-    use sysinfo::System;
+pub async fn get_system_info() -> Result<SystemInfo, String> {
+    tokio::task::spawn_blocking(|| {
+        use sysinfo::System;
 
-    let mut sys = System::new_all();
-    sys.refresh_all();
+        // Refresh only what we need — avoid the full process scan that
+        // refresh_all() performs (hundreds of ms on busy machines).
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.refresh_cpu_all();
 
-    let cpu_brand = sys.cpus().first()
-        .map(|cpu| cpu.brand().to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
+        let cpu_brand = sys.cpus().first()
+            .map(|cpu| cpu.brand().to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
 
-    let (gpu_name, gpu_driver) = get_gpu_info();
+        let (gpu_name, gpu_driver) = get_gpu_info();
 
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let disk = disks.iter().find(|d| {
-        let mount = d.mount_point().to_string_lossy();
-        mount == "C:\\" || mount == "C:/" || mount == "/"
-    }).or_else(|| disks.iter().next());
-    let (disk_free, disk_total, disk_kind) = if let Some(d) = disk {
-        let kind = match d.kind() {
-            sysinfo::DiskKind::SSD => "SSD".to_string(),
-            sysinfo::DiskKind::HDD => "HDD".to_string(),
-            _ => "Unknown".to_string(),
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let disk = disks.iter().find(|d| {
+            let mount = d.mount_point().to_string_lossy();
+            mount == "C:\\" || mount == "C:/" || mount == "/"
+        }).or_else(|| disks.iter().next());
+        let (disk_free, disk_total, disk_kind) = if let Some(d) = disk {
+            let kind = match d.kind() {
+                sysinfo::DiskKind::SSD => "SSD".to_string(),
+                sysinfo::DiskKind::HDD => "HDD".to_string(),
+                _ => "Unknown".to_string(),
+            };
+            (d.available_space(), d.total_space(), kind)
+        } else {
+            (0u64, 0u64, "Unknown".to_string())
         };
-        (d.available_space(), d.total_space(), kind)
-    } else {
-        (0u64, 0u64, "Unknown".to_string())
-    };
 
-    let info = SystemInfo {
-        os_name: System::name().unwrap_or_else(|| "Unknown".to_string()),
-        os_version: System::os_version().unwrap_or_else(|| "Unknown".to_string()),
-        kernel_version: System::kernel_version().unwrap_or_else(|| "Unknown".to_string()),
-        hostname: System::host_name().unwrap_or_else(|| "Unknown".to_string()),
-        cpu_brand,
-        cpu_cores: sys.cpus().len(),
-        total_memory: sys.total_memory(),
-        used_memory: sys.used_memory(),
-        total_swap: sys.total_swap(),
-        used_swap: sys.used_swap(),
-        gpu_name,
-        gpu_driver,
-        disk_free,
-        disk_total,
-        disk_kind,
-    };
+        let info = SystemInfo {
+            os_name: System::name().unwrap_or_else(|| "Unknown".to_string()),
+            os_version: System::os_version().unwrap_or_else(|| "Unknown".to_string()),
+            kernel_version: System::kernel_version().unwrap_or_else(|| "Unknown".to_string()),
+            hostname: System::host_name().unwrap_or_else(|| "Unknown".to_string()),
+            cpu_brand,
+            cpu_cores: sys.cpus().len(),
+            total_memory: sys.total_memory(),
+            used_memory: sys.used_memory(),
+            total_swap: sys.total_swap(),
+            used_swap: sys.used_swap(),
+            gpu_name,
+            gpu_driver,
+            disk_free,
+            disk_total,
+            disk_kind,
+        };
 
-    Ok(info)
+        Ok(info)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[command]
-pub fn grant_folder_permissions(path: String) -> Result<(), String> {
+pub async fn grant_folder_permissions(path: String) -> Result<(), String> {
     let target = Path::new(&path);
     if !target.exists() {
         return Err(format!("Directory does not exist: {}", path));
     }
 
-    let username = std::env::var("USERNAME").map_err(|_| "Cannot determine current user")?;
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
 
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
+        #[cfg(target_os = "windows")]
+        let path_owned = path.clone();
+        #[cfg(target_os = "windows")]
+        let username = std::env::var("USERNAME").map_err(|_| "Cannot determine current user".to_string())?;
+        #[cfg(target_os = "windows")]
+        let output = std::process::Command::new("icacls")
+            .arg(&path_owned)
+            .arg("/grant")
+            .arg(format!("{}:(OI)(CI)F", username))
+            .arg("/T")
+            .arg("/Q")
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|e| format!("Failed to run icacls: {}", e))?;
 
-    #[cfg(target_os = "windows")]
-    let output = std::process::Command::new("icacls")
-        .arg(&path)
-        .arg("/grant")
-        .arg(format!("{}:(OI)(CI)F", username))
-        .arg("/T")
-        .arg("/Q")
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| format!("Failed to run icacls: {}", e))?;
+        #[cfg(target_os = "windows")]
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("icacls failed: {}", stderr));
+        }
 
-    #[cfg(target_os = "windows")]
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("icacls failed: {}", stderr));
-    }
-
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn netsh_run(args: &[&str]) -> Result<std::process::Output, String> {
@@ -1103,11 +1411,11 @@ pub fn check_folder_permissions(game_path: String) -> Result<FolderPermissionsSt
 }
 
 #[command]
-pub fn fix_folder_permissions(game_path: String) -> Result<(), String> {
+pub async fn fix_folder_permissions(game_path: String) -> Result<(), String> {
     let launcher_dir = get_launcher_dir()?;
-    grant_folder_permissions(launcher_dir)?;
+    grant_folder_permissions(launcher_dir).await?;
     if !game_path.is_empty() {
-        grant_folder_permissions(game_path)?;
+        grant_folder_permissions(game_path).await?;
     }
     Ok(())
 }
@@ -1901,18 +2209,23 @@ pub fn set_game_settings(settings: GameSettings) -> Result<(), String> {
 // Raw structure of the remote latest.json (new multi-platform format)
 #[derive(Debug, Clone, Deserialize)]
 struct UpdatePlatformWindows {
+    #[allow(dead_code)]
     exe: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct UpdatePlatformLinux {
+    #[allow(dead_code)]
     appimage: Option<String>,
+    #[allow(dead_code)]
     deb: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct UpdatePlatforms {
+    #[allow(dead_code)]
     windows: Option<UpdatePlatformWindows>,
+    #[allow(dead_code)]
     linux: Option<UpdatePlatformLinux>,
 }
 
@@ -1938,64 +2251,158 @@ pub struct UpdateInfo {
     pub product_name: String,
 }
 
-#[command]
-pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
-    const UPDATE_URL: &str = "https://rocket.nightriderz.world/latest.json";
-    const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+async fn check_for_updates_impl(use_beta_channel: bool) -> Result<Option<UpdateInfo>, String> {
+    const UPDATE_BASE_URL: &str = "https://rocket.nightriderz.world";
+    let current_version = option_env!("ROCKET_LAUNCHER_VERSION")
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
+    fn parse_version(v: &str) -> (u32, u32, u32, bool, u32) {
+        let trimmed = v.trim();
+        let (base, is_beta, beta_number) = if let Some((base, beta_suffix)) = trimmed.split_once("-beta.") {
+            (base, true, beta_suffix.parse().unwrap_or(0))
+        } else if let Some(base) = trimmed.strip_suffix('b') {
+            (base, true, 0)
+        } else {
+            (trimmed, false, 0)
+        };
+
+        let parts: Vec<u32> = base.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+        (
+            parts.get(0).copied().unwrap_or(0),
+            parts.get(1).copied().unwrap_or(0),
+            parts.get(2).copied().unwrap_or(0),
+            is_beta,
+            beta_number,
+        )
+    }
+
+    fn is_newer(
+        remote: (u32, u32, u32, bool, u32),
+        current: (u32, u32, u32, bool, u32),
+        beta_channel: bool,
+    ) -> bool {
+        let remote_core = (remote.0, remote.1, remote.2);
+        let current_core = (current.0, current.1, current.2);
+
+        if remote_core != current_core {
+            return remote_core > current_core;
+        }
+
+        match (remote.3, current.3) {
+            (false, true) => true,
+            (true, false) => beta_channel,
+            (true, true) => remote.4 > current.4,
+            (false, false) => false,
+        }
+    }
+
+    fn core(v: (u32, u32, u32, bool, u32)) -> (u32, u32, u32) {
+        (v.0, v.1, v.2)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn pick_artifact(raw: &LatestJsonRemote) -> Option<String> {
+        raw.platforms.windows.as_ref().map(|p| p.exe.clone())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pick_artifact(raw: &LatestJsonRemote) -> Option<String> {
+        raw.platforms.linux.as_ref().and_then(|p| p.deb.clone())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    fn pick_artifact(_raw: &LatestJsonRemote) -> Option<String> {
+        None
+    }
+
+    async fn fetch_update_doc(
+        client: &reqwest::Client,
+        url: String,
+    ) -> Result<Option<LatestJsonRemote>, String> {
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch update info: {}", e))?;
+
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Err(format!("Server returned error: {}", response.status()));
+        }
+
+        let raw: LatestJsonRemote = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse update info: {}", e))?;
+        Ok(Some(raw))
+    }
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let response = client
-        .get(UPDATE_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch update info: {}", e))?;
+    let (selected_raw, selected_from_beta) = if use_beta_channel {
+        let beta_raw = fetch_update_doc(&client, format!("{}/beta.json", UPDATE_BASE_URL)).await?;
+        let stable_raw = fetch_update_doc(&client, format!("{}/latest.json", UPDATE_BASE_URL)).await?;
 
-    if !response.status().is_success() {
-        return Err(format!("Server returned error: {}", response.status()));
-    }
+        match (beta_raw, stable_raw) {
+            (Some(beta), Some(stable)) => {
+                let beta_core = core(parse_version(&beta.version));
+                let stable_core = core(parse_version(&stable.version));
+                // Insider rule: prefer beta by default, but if release is strictly
+                // higher than beta, force release.
+                if stable_core > beta_core {
+                    (stable, false)
+                } else {
+                    (beta, true)
+                }
+            }
+            (Some(beta), None) => (beta, true),
+            (None, Some(stable)) => (stable, false),
+            (None, None) => return Ok(None),
+        }
+    } else {
+        let stable_raw = fetch_update_doc(&client, format!("{}/latest.json", UPDATE_BASE_URL)).await?;
+        let Some(stable) = stable_raw else {
+            return Ok(None);
+        };
+        (stable, false)
+    };
 
-    let raw: LatestJsonRemote = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse update info: {}", e))?;
-
-    // Pick the artifact for the platform we are currently running on
-    #[cfg(target_os = "windows")]
-    let artifact: Option<String> = raw.platforms.windows.map(|p| p.exe);
-
-    #[cfg(target_os = "linux")]
-    let artifact: Option<String> = raw.platforms.linux.and_then(|p| p.deb);
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let artifact: Option<String> = None;
-
-    let artifact = match artifact {
+    let artifact = match pick_artifact(&selected_raw) {
         Some(a) => a,
         None => return Ok(None),
     };
 
-    fn parse_semver(v: &str) -> (u32, u32, u32) {
-        let parts: Vec<u32> = v.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-        (parts.get(0).copied().unwrap_or(0), parts.get(1).copied().unwrap_or(0), parts.get(2).copied().unwrap_or(0))
-    }
+    let remote = parse_version(&selected_raw.version);
+    let current = parse_version(current_version);
+    let beta_compare = use_beta_channel || selected_from_beta;
 
-    let remote = parse_semver(&raw.version);
-    let current = parse_semver(CURRENT_VERSION);
-
-    if remote > current {
+    if is_newer(remote, current, beta_compare) {
         Ok(Some(UpdateInfo {
-            version: raw.version,
+            version: selected_raw.version,
             exe: artifact,
-            publish_date: raw.publish_date,
-            product_name: raw.product_name,
+            publish_date: selected_raw.publish_date,
+            product_name: selected_raw.product_name,
         }))
     } else {
         Ok(None)
     }
+}
+
+#[command]
+pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
+    let compiled_beta_channel = option_env!("ROCKET_LAUNCHER_CHANNEL").unwrap_or("stable") == "beta";
+    check_for_updates_impl(compiled_beta_channel).await
+}
+
+#[command]
+pub async fn check_for_beta_updates() -> Result<Option<UpdateInfo>, String> {
+    check_for_updates_impl(true).await
 }
 
 #[command]
@@ -2029,7 +2436,8 @@ pub async fn download_update(exe_name: String) -> Result<String, String> {
         .map_err(|e| format!("Failed to read download: {}", e))?;
     
     
-    std::fs::write(&dest_path, bytes)
+    tokio::fs::write(&dest_path, bytes)
+        .await
         .map_err(|e| format!("Failed to save installer: {}", e))?;
     
     
@@ -2041,10 +2449,28 @@ pub async fn install_update(installer_path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
+        use std::os::windows::process::CommandExt;
 
-        Command::new(&installer_path)
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Cannot determine current executable path: {}", e))?;
+
+        let script_path = std::env::temp_dir().join("rocket-launcher-update.cmd");
+        let installer_escaped = installer_path.replace('%', "%%");
+        let launcher_escaped = current_exe.to_string_lossy().replace('%', "%%");
+        let script = format!(
+            "@echo off\r\nsetlocal\r\nset \"INST={installer}\"\r\nset \"LAUNCH={launcher}\"\r\nstart \"\" /wait \"%INST%\" /S\r\nif exist \"%LAUNCH%\" start \"\" \"%LAUNCH%\"\r\ndel /f /q \"%INST%\" >nul 2>&1\r\ndel /f /q \"%~f0\" >nul 2>&1\r\n",
+            installer = installer_escaped,
+            launcher = launcher_escaped
+        );
+        std::fs::write(&script_path, script)
+            .map_err(|e| format!("Failed to create update script: {}", e))?;
+
+        Command::new("cmd")
+            .arg("/C")
+            .arg(&script_path)
+            .creation_flags(0x08000000)
             .spawn()
-            .map_err(|e| format!("Failed to launch installer: {}", e))?;
+            .map_err(|e| format!("Failed to launch silent update: {}", e))?;
 
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2061,15 +2487,18 @@ pub async fn install_update(installer_path: String) -> Result<(), String> {
             .map_err(|e| format!("Cannot determine current executable path: {}", e))?;
 
         // Make the downloaded AppImage executable
-        let metadata = std::fs::metadata(&installer_path)
+        let metadata = tokio::fs::metadata(&installer_path)
+            .await
             .map_err(|e| format!("Cannot stat installer: {}", e))?;
         let mut perms = metadata.permissions();
         perms.set_mode(perms.mode() | 0o755);
-        std::fs::set_permissions(&installer_path, perms)
+        tokio::fs::set_permissions(&installer_path, perms)
+            .await
             .map_err(|e| format!("Cannot chmod installer: {}", e))?;
 
         // Replace the current executable with the new AppImage
-        std::fs::copy(&installer_path, &current_exe)
+        tokio::fs::copy(&installer_path, &current_exe)
+            .await
             .map_err(|e| format!("Failed to replace current AppImage: {}", e))?;
 
         // Relaunch from the updated executable and exit

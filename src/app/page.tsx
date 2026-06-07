@@ -21,22 +21,17 @@ function ContentPanel() {
   const { currentPage, setPage } = useLauncherStore();
   const [displayedPage, setDisplayedPage] = useState(currentPage);
   const [transitionClass, setTransitionClass] = useState("animate-fade-in");
-  const [isWindows, setIsWindows] = useState(true);
-  const [sysInfoLoaded, setSysInfoLoaded] = useState(false);
-
   useEffect(() => {
     import("@/lib/tauri-api")
       .then(({ getSystemInfo }) => getSystemInfo())
       .then((sysInfo) => {
         const isWin = sysInfo.os_name.toLowerCase().includes("windows");
-        setIsWindows(isWin);
         // Redirect to main if trying to access security on non-Windows
         if (!isWin && currentPage === "security") {
           setPage("main");
         }
       })
-      .catch(() => setIsWindows(true))
-      .finally(() => setSysInfoLoaded(true));
+      .catch(() => {});
 
     if (currentPage !== displayedPage) {
       setTransitionClass("animate-fade-out");
@@ -60,10 +55,6 @@ function ContentPanel() {
         return <MainScreen />;
     }
   })();
-
-  if (!sysInfoLoaded) {
-    return <div className="flex-1 flex flex-col min-h-0" />;
-  }
 
   return (
     <div key={displayedPage} className={`flex-1 flex flex-col min-h-0 ${transitionClass}`}>

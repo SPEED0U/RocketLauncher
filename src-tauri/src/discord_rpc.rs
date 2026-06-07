@@ -66,16 +66,19 @@ fn set_activity_with_retry(
                     if app_id.is_empty() {
                         return Err("Discord RPC not initialized".into());
                     }
+                    let old_client = {
+                        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+                        client_lock.take()
+                    };
+                    if let Some(mut old) = old_client {
+                        let _ = old.close();
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    let new_client =
+                        connect_client(&app_id).map_err(|e2| format!("reconnect failed: {}", e2))?;
                     {
                         let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
-                        if let Some(mut old) = client_lock.take() {
-                            let _ = old.close();
-                        }
-                        std::thread::sleep(Duration::from_millis(500));
-                        match connect_client(&app_id) {
-                            Ok(c) => *client_lock = Some(c),
-                            Err(e2) => return Err(format!("reconnect failed: {}", e2)),
-                        }
+                        *client_lock = Some(new_client);
                     }
                 } else {
                     return Err(e);
@@ -153,16 +156,24 @@ fn do_set_activity(
         .map_err(|e| format!("{}", e))
 }
 
-#[command]
-pub fn discord_rpc_init() -> Result<(), String> {
-    let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
-    let mut current_id = CURRENT_APP_ID.lock().map_err(|e| e.to_string())?;
-
-    if *current_id == LAUNCHER_APP_ID && client_lock.is_some() {
+fn discord_rpc_init_sync() -> Result<(), String> {
+    let current_id_value = CURRENT_APP_ID
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let has_client = RPC_CLIENT
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if current_id_value == LAUNCHER_APP_ID && has_client {
         return Ok(());
     }
 
-    if let Some(mut old) = client_lock.take() {
+    let old_client = {
+        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+        client_lock.take()
+    };
+    if let Some(mut old) = old_client {
         let _ = old.clear_activity();
         let _ = old.close();
         drop(old);
@@ -170,27 +181,41 @@ pub fn discord_rpc_init() -> Result<(), String> {
     }
 
     let client = connect_client(LAUNCHER_APP_ID)?;
-    *client_lock = Some(client);
-    *current_id = LAUNCHER_APP_ID.to_string();
+    {
+        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+        *client_lock = Some(client);
+    }
+    {
+        let mut current_id = CURRENT_APP_ID.lock().map_err(|e| e.to_string())?;
+        *current_id = LAUNCHER_APP_ID.to_string();
+    }
     *RPC_START_TIME.lock().map_err(|e| e.to_string())? = Some(now_epoch());
     Ok(())
 }
 
-#[command]
-pub fn discord_rpc_reconnect(app_id: Option<String>) -> Result<(), String> {
+fn discord_rpc_reconnect_sync(app_id: Option<String>) -> Result<(), String> {
     let target_id = app_id
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_GAME_APP_ID);
 
-    let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
-    let mut current_id = CURRENT_APP_ID.lock().map_err(|e| e.to_string())?;
-
-    if *current_id == target_id && client_lock.is_some() {
+    let current_id_value = CURRENT_APP_ID
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone();
+    let has_client = RPC_CLIENT
+        .lock()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if current_id_value == target_id && has_client {
         return Ok(());
     }
 
-    if let Some(mut old) = client_lock.take() {
+    let old_client = {
+        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+        client_lock.take()
+    };
+    if let Some(mut old) = old_client {
         let _ = old.clear_activity();
         let _ = old.close();
         drop(old);
@@ -198,10 +223,60 @@ pub fn discord_rpc_reconnect(app_id: Option<String>) -> Result<(), String> {
     }
 
     let client = connect_client(target_id)?;
-    *client_lock = Some(client);
-    *current_id = target_id.to_string();
+    {
+        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+        *client_lock = Some(client);
+    }
+    {
+        let mut current_id = CURRENT_APP_ID.lock().map_err(|e| e.to_string())?;
+        *current_id = target_id.to_string();
+    }
     *RPC_START_TIME.lock().map_err(|e| e.to_string())? = Some(now_epoch());
     Ok(())
+}
+
+fn discord_rpc_update_sync(
+    state: Option<String>,
+    details: Option<String>,
+    large_image: Option<String>,
+    large_text: Option<String>,
+    small_image: Option<String>,
+    small_text: Option<String>,
+    button1_label: Option<String>,
+    button1_url: Option<String>,
+    button2_label: Option<String>,
+    button2_url: Option<String>,
+) -> Result<(), String> {
+    set_activity_with_retry(
+        state, details, large_image, large_text, small_image, small_text, button1_label,
+        button1_url, button2_label, button2_url,
+    )
+}
+
+fn discord_rpc_stop_sync() -> Result<(), String> {
+    let old_client = {
+        let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
+        client_lock.take()
+    };
+
+    if let Some(mut client) = old_client {
+        let _ = client.clear_activity();
+        let _ = client.close();
+    }
+
+    *CURRENT_APP_ID.lock().map_err(|e| e.to_string())? = String::new();
+    *RPC_START_TIME.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
+}
+
+#[command]
+pub fn discord_rpc_init() -> Result<(), String> {
+    discord_rpc_init_sync()
+}
+
+#[command]
+pub fn discord_rpc_reconnect(app_id: Option<String>) -> Result<(), String> {
+    discord_rpc_reconnect_sync(app_id)
 }
 
 #[command]
@@ -217,24 +292,21 @@ pub fn discord_rpc_update(
     button2_label: Option<String>,
     button2_url: Option<String>,
 ) -> Result<(), String> {
-    set_activity_with_retry(
-        state, details, large_image, large_text,
-        small_image, small_text, button1_label, button1_url,
-        button2_label, button2_url,
+    discord_rpc_update_sync(
+        state,
+        details,
+        large_image,
+        large_text,
+        small_image,
+        small_text,
+        button1_label,
+        button1_url,
+        button2_label,
+        button2_url,
     )
 }
 
 #[command]
 pub fn discord_rpc_stop() -> Result<(), String> {
-    let mut client_lock = RPC_CLIENT.lock().map_err(|e| e.to_string())?;
-    let mut current_id = CURRENT_APP_ID.lock().map_err(|e| e.to_string())?;
-
-    if let Some(mut client) = client_lock.take() {
-        let _ = client.clear_activity();
-        let _ = client.close();
-    }
-
-    *current_id = String::new();
-    *RPC_START_TIME.lock().map_err(|e| e.to_string())? = None;
-    Ok(())
+    discord_rpc_stop_sync()
 }

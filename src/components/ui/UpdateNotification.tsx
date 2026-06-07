@@ -4,9 +4,13 @@ import { useEffect, useState, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Download, X, RefreshCw } from "lucide-react";
 import { useUpdateStore } from "@/stores/updateStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { formatVersionForDisplay } from "@/lib/config";
+import { Button } from "@/components/ui/Button";
+import { ProgressBar } from "@/components/ui/ProgressBar";
 
 interface UpdateInfo {
   version: string;
@@ -27,12 +31,18 @@ export function UpdateNotification() {
     setDownloading,
     setDownloadProgress,
   } = useUpdateStore();
+  const { settings } = useSettingsStore();
 
   const [showModal, setShowModal] = useState(false);
   const [visible, setVisible] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [actionPhase, setActionPhase] = useState<"buttons" | "switching" | "progress">("buttons");
   const [isSpinning, setIsSpinning] = useState(false);
   const [iconAngle, setIconAngle] = useState(0);
+
+  const displayVersion = updateInfo?.version
+    ? formatVersionForDisplay(updateInfo.version)
+    : undefined;
 
   const MAX_SPEED = 0.5;
   const ACCEL_MS  = 500;
@@ -44,6 +54,7 @@ export function UpdateNotification() {
   const decelStartRef  = useRef(0);
   const decelTargetRef = useRef(0);
   const pendingStop    = useRef(false);
+  const actionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   function startSpinLoop() {
     let last = performance.now();
@@ -110,7 +121,10 @@ export function UpdateNotification() {
     pendingStop.current = true;
   }
 
-  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (actionTimerRef.current) clearTimeout(actionTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (checking) {
@@ -139,7 +153,29 @@ export function UpdateNotification() {
 
     const interval = setInterval(checkForUpdates, 5 * 60 * 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [settings.insider]);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.key.toLowerCase() !== "u") return;
+      event.preventDefault();
+      setError(null);
+      setDownloading(false);
+      setDownloadProgress(0);
+      setUpdateAvailable(true, {
+        version: "0.0.0-dev",
+        exe: "rocket-launcher-dev-installer.exe",
+        publishDate: new Date().toISOString(),
+        productName: "Rocket Launcher (Dev)",
+      });
+      openPopup();
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [setDownloadProgress, setDownloading, setUpdateAvailable]);
 
   async function checkForUpdates() {
     if (checking || downloading) return;
@@ -148,7 +184,8 @@ export function UpdateNotification() {
       setChecking(true);
       setError(null);
 
-      const result = await invoke<UpdateInfo | null>("check_for_updates");
+      const command = settings.insider ? "check_for_beta_updates" : "check_for_updates";
+      const result = await invoke<UpdateInfo | null>(command);
 
       if (result) {
         setUpdateAvailable(true, result);
@@ -167,9 +204,14 @@ export function UpdateNotification() {
     if (!updateInfo || downloading) return;
 
     try {
-      setDownloading(true);
       setError(null);
       setDownloadProgress(0);
+      setActionPhase("switching");
+      if (actionTimerRef.current) clearTimeout(actionTimerRef.current);
+      actionTimerRef.current = setTimeout(() => {
+        setActionPhase("progress");
+      }, 180);
+      setDownloading(true);
 
       const installerPath = await invoke<string>("download_update", {
         exeName: updateInfo.exe,
@@ -183,6 +225,11 @@ export function UpdateNotification() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
       setDownloading(false);
+      if (actionTimerRef.current) {
+        clearTimeout(actionTimerRef.current);
+        actionTimerRef.current = null;
+      }
+      setActionPhase("buttons");
     }
   }
 
@@ -191,7 +238,7 @@ export function UpdateNotification() {
 
   return (
     <>
-      <Tooltip label={checking ? "Checking for updates..." : updateAvailable ? `Update available: ${updateInfo?.version}` : "Check for updates"}>
+      <Tooltip label={checking ? "Checking for updates..." : updateAvailable ? `Update available: ${displayVersion}` : "Check for updates"}>
         <button
           onClick={() => {
             if (updateAvailable) {
@@ -202,8 +249,8 @@ export function UpdateNotification() {
             }
           }}
           className={cn(
-            "relative p-2 rounded-md transition-colors",
-            "hover:bg-white/10",
+            "relative p-2 rounded-md transition-all duration-200 ease-out",
+            "hover:bg-white/10 hover:scale-105 active:scale-95",
             isSpinning && "cursor-not-allowed",
             updateAvailable && !isSpinning && "animate-pulse-green"
           )}
@@ -231,76 +278,93 @@ export function UpdateNotification() {
       </Tooltip>
       {showModal && updateInfo && createPortal(
         <div
-          className="fixed top-16 right-4 w-80 bg-surface border border-border rounded-lg shadow-2xl z-[9999] transition-all duration-300"
+          className="fixed top-16 right-4 w-84 z-[9999] transition-all duration-250 ease-out"
           style={{
             opacity: visible ? 1 : 0,
-            transform: visible ? "translateY(0) scale(1)" : "translateY(-12px) scale(0.96)",
+            transform: visible ? "translateY(0)" : "translateY(-8px)",
             pointerEvents: visible ? "auto" : "none",
           }}
         >
-          <div className="p-4 space-y-3">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-full bg-blue-500/10 flex items-center justify-center">
-                  <Download size={16} className="text-blue-400" />
+          <div className="rounded-xl border border-border/50 bg-surface shadow-2xl">
+            <div className="p-4 space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-lg bg-surface-hover/80 border border-border/60 flex items-center justify-center shrink-0">
+                    <Download size={14} className="text-primary" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[10px] uppercase tracking-widest text-muted">Launcher Update</p>
+                    <h3 className="text-sm font-semibold text-foreground truncate">
+                      Version {displayVersion ?? "unknown"} available
+                    </h3>
+                  </div>
                 </div>
-                <div>
-                  <h3 className="text-sm font-semibold text-white">
-                    Update Available
-                  </h3>
-                  <p className="text-xs text-gray-400">
-                    Version {updateInfo.version}
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={closePopup}
-                className="p-1 hover:bg-white/10 rounded transition-colors"
-              >
-                <X size={14} className="text-gray-400" />
-              </button>
-            </div>
-            {error && (
-              <div className="p-2 bg-red-500/10 border border-red-500/30 rounded text-xs text-red-400">
-                {error}
-              </div>
-            )}
-            {downloading && (
-              <div className="space-y-1.5">
-                <div className="flex justify-between text-xs">
-                  <span className="text-gray-400">Downloading...</span>
-                  <span className="text-white">{downloadProgress}%</span>
-                </div>
-                <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-blue-500 transition-all duration-300"
-                    style={{ width: `${downloadProgress}%` }}
-                  />
-                </div>
-              </div>
-            )}
-            {!downloading && (
-              <div className="flex gap-2">
-                <button
-                  onClick={handleDownloadAndInstall}
-                  className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-md transition-colors flex items-center justify-center gap-1.5"
-                >
-                  <Download size={12} />
-                  Install
-                </button>
                 <button
                   onClick={closePopup}
-                  className="px-3 py-2 bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-medium rounded-md transition-colors"
+                  className="p-1 rounded-md text-muted hover:text-foreground hover:bg-surface-hover transition-smooth"
                 >
-                  Later
+                  <X size={14} />
                 </button>
               </div>
-            )}
 
-            <p className="text-[10px] text-gray-500 text-center leading-tight">
-              Launcher will restart after installation
-            </p>
+              <div className="rounded-lg border border-border/50 bg-background/40 px-3 py-2">
+                <p className="text-[11px] text-muted leading-relaxed">
+                  A new version of Rocket Launcher is available. Install it to get the latest fixes and improvements.
+                </p>
+              </div>
+
+              <div className="relative min-h-[2.25rem]">
+                <div
+                  className={cn(
+                    "absolute inset-0 space-y-2 transition-all duration-250 ease-out",
+                    actionPhase === "progress"
+                      ? "opacity-100"
+                      : "opacity-0 pointer-events-none"
+                  )}
+                >
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-muted">Downloading...</span>
+                    <span className="font-mono text-foreground">{Math.round(downloadProgress)}%</span>
+                  </div>
+                  <ProgressBar value={downloadProgress} showPercent={false} size="sm" variant="primary" />
+                </div>
+
+                <div
+                  className={cn(
+                    "absolute inset-0 transition-all duration-250 ease-out",
+                    actionPhase === "progress" || actionPhase === "switching"
+                      ? "opacity-0 pointer-events-none"
+                      : "opacity-100"
+                  )}
+                >
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={handleDownloadAndInstall}
+                      size="sm"
+                      className="flex-1 gap-1.5 transition-all duration-150 ease-out active:scale-95"
+                    >
+                      <Download size={12} />
+                      Install Update
+                    </Button>
+                    <Button
+                      onClick={closePopup}
+                      variant="ghost"
+                      size="sm"
+                      className="transition-all duration-150 ease-out active:scale-95"
+                    >
+                      Later
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+            </div>
           </div>
+          {error && (
+            <div className="mt-2 rounded-lg border border-danger/40 bg-surface px-3 py-2 text-[11px] text-danger shadow-lg">
+              {error}
+            </div>
+          )}
         </div>,
         document.body
       )}

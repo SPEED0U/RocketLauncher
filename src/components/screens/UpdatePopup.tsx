@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { useLauncherStore } from "@/stores/launcherStore";
 import { Download, SkipForward } from "lucide-react";
+import { formatVersionForDisplay } from "@/lib/config";
 
 interface UpdatePopupProps {
   latestVersion: string;
@@ -17,6 +18,7 @@ export function UpdatePopup({
   downloadUrl,
 }: UpdatePopupProps) {
   const { showUpdatePopup, setShowUpdatePopup } = useLauncherStore();
+  const displayVersion = formatVersionForDisplay(latestVersion);
 
   function handleUpdate() {
     if (downloadUrl) {
@@ -35,7 +37,7 @@ export function UpdatePopup({
       <div className="space-y-4">
         <p className="text-xs text-muted">
           A new version of the launcher is available:{" "}
-          <span className="text-foreground font-semibold">{latestVersion}</span>
+          <span className="text-foreground font-semibold">{displayVersion}</span>
         </p>
 
         {changelog && (

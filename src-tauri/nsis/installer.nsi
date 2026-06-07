@@ -87,6 +87,14 @@ Function LaunchApp
   Exec '"$INSTDIR\${__TAURI_MAIN_BINARY_NAME__}.exe"'
 FunctionEnd
 
+; Auto-restart the launcher after silent update installation.
+; Interactive installs keep the existing finish-page behavior.
+Function .onInstSuccess
+  IfSilent 0 done
+  Exec '"$INSTDIR\${__TAURI_MAIN_BINARY_NAME__}.exe"'
+done:
+FunctionEnd
+
 ; ===== Uninstaller Section =====
 Section "Uninstall"
   ; Kill running process

@@ -21,46 +21,60 @@ async function askVersion() {
   });
 
   return new Promise((resolve) => {
-    rl.question('Enter version number (ex: 1.0.0): ', (version) => {
+    rl.question('Enter version number (ex: 1.0.0 or 1.0.0b): ', (version) => {
       rl.close();
       resolve(version.trim());
     });
   });
 }
 
+function isBetaVersion(version) {
+  return version.endsWith('b');
+}
+
+function manifestVersion(version) {
+  return isBetaVersion(version) ? `${version.slice(0, -1)}-beta.0` : version;
+}
+
 function updateVersion(version) {
   console.log(`\npdating version to ${version}...\n`);
+  const cargoVersion = manifestVersion(version);
 
   // Update tauri.conf.json
   const tauriConfPath = join(tauriDir, 'tauri.conf.json');
   const tauriConf = JSON.parse(readFileSync(tauriConfPath, 'utf8'));
-  tauriConf.version = version;
+  tauriConf.version = cargoVersion;
   writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2) + '\n', 'utf8');
   console.log('Updated tauri.conf.json');
 
   // Update Cargo.toml
   const cargoTomlPath = join(tauriDir, 'Cargo.toml');
   let cargoToml = readFileSync(cargoTomlPath, 'utf8');
-  cargoToml = cargoToml.replace(/version = "[^"]+"/g, `version = "${version}"`);
+  cargoToml = cargoToml.replace(/version = "[^"]+"/g, `version = "${cargoVersion}"`);
   writeFileSync(cargoTomlPath, cargoToml, 'utf8');
   console.log('Updated Cargo.toml');
 
   // Update package.json
   const packageJsonPath = join(rootDir, 'package.json');
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-  packageJson.version = version;
+  packageJson.version = cargoVersion;
   writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf8');
   console.log('Updated package.json\n');
 }
 
-function runBuild() {
+function runBuild(version) {
   return new Promise((resolve, reject) => {
     console.log('Building app...\n');
 
     const proc = spawn('npx', ['tauri', 'build'], {
       cwd: rootDir,
       shell: true,
-      stdio: 'inherit'
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        ROCKET_LAUNCHER_VERSION: version,
+        ROCKET_LAUNCHER_CHANNEL: isBetaVersion(version) ? 'beta' : 'stable'
+      }
     });
 
     proc.on('close', (code) => {
@@ -93,9 +107,10 @@ function findExeFile(bundleDir) {
   return join(nsisDir, exeFile);
 }
 
-function createLatestJson(version, exePath) {
+function createReleaseJson(version, exePath) {
   const exeName = basename(exePath);
-  const latestJsonPath = join(dirname(exePath), 'latest.json');
+  const jsonName = isBetaVersion(version) ? 'beta.json' : 'latest.json';
+  const latestJsonPath = join(dirname(exePath), jsonName);
 
   const latestData = {
     version: version,
@@ -107,7 +122,7 @@ function createLatestJson(version, exePath) {
 
   writeFileSync(latestJsonPath, JSON.stringify(latestData, null, 2) + '\n', 'utf8');
   
-  console.log('\nCreated latest.json:');
+  console.log(`\nCreated ${jsonName}:`);
   console.log(JSON.stringify(latestData, null, 2));
   console.log(`\nLocation: ${latestJsonPath}\n`);
 }
@@ -120,8 +135,8 @@ async function main() {
       console.log('Building FINAL release\n');
       version = await askVersion();
       
-      if (!version || !/^\d+\.\d+\.\d+/.test(version)) {
-        console.error('Invalid version format. Expected: x.y.z');
+      if (!version || !/^\d+\.\d+\.\d+b?$/.test(version)) {
+        console.error('Invalid version format. Expected: x.y.z or x.y.zb');
         process.exit(1);
       }
 
@@ -135,7 +150,7 @@ async function main() {
     }
 
     // Run build
-    await runBuild();
+    await runBuild(version);
 
     if (isFinal) {
       console.log('\ninalizing release...\n');
@@ -144,8 +159,8 @@ async function main() {
       const bundleDir = join(tauriDir, 'target', 'release', 'bundle');
       const exePath = findExeFile(bundleDir);
 
-      // Create latest.json
-      createLatestJson(version, exePath);
+      // Create the channel-specific update file
+      createReleaseJson(version, exePath);
 
       console.log('Final release build complete!\n');
     } else {

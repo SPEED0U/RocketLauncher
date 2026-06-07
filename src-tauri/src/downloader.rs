@@ -6,8 +6,8 @@ use sha1::Sha1;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::collections::{HashMap, VecDeque};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -143,13 +143,6 @@ fn is_lzma(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x5D && data[1] == 0x00
 }
 
-fn decompress_lzma(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    let mut reader = Cursor::new(data);
-    lzma_decompress(&mut reader, &mut output).map_err(|e| format!("LZMA decompress error: {}", e))?;
-    Ok(output)
-}
-
 
 fn md5_base64_file(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -212,48 +205,67 @@ fn strip_first_component(path: &str) -> &str {
 }
 
 
-/// Exponentially-weighted moving-average speed estimator.
+/// Short-window speed estimator.
 ///
-/// Each call to `push(cumulative_bytes)` measures the instantaneous speed
-/// since the previous call and blends it into a smoothed value using:
-///   `smoothed = α × instant + (1−α) × smoothed`
-///
-/// With α=0.10 and a 200 ms ticker the effective time-constant is ~2 s,
-/// which is responsive enough to follow real slowdowns while preventing
-/// the sudden spikes caused by TCP burst / slow-start phases or momentary
-/// pauses between chunks.
+/// Uses the latest samples to estimate transfer speed with less lag than a
+/// long EWMA, while still smoothing single-tick spikes.
 struct SpeedEwma {
-    last_bytes: u64,
-    last_time: Option<std::time::Instant>,
+    samples: VecDeque<(std::time::Instant, u64)>,
     smoothed: f64,
     alpha: f64,
+    window: std::time::Duration,
 }
 
 impl SpeedEwma {
     fn new(alpha: f64) -> Self {
-        Self { last_bytes: 0, last_time: None, smoothed: 0.0, alpha }
+        Self {
+            samples: VecDeque::with_capacity(8),
+            smoothed: 0.0,
+            alpha,
+            window: std::time::Duration::from_secs(2),
+        }
     }
 
     /// Push the current cumulative byte count and return smoothed bytes/sec.
     fn push(&mut self, bytes: u64) -> u64 {
         let now = std::time::Instant::now();
-        if let Some(last_t) = self.last_time {
-            let dt = now.duration_since(last_t).as_secs_f64();
-            if dt >= 0.05 {
-                let instant = bytes.saturating_sub(self.last_bytes) as f64 / dt;
-                self.smoothed = if self.smoothed == 0.0 {
-                    instant
-                } else {
-                    self.alpha * instant + (1.0 - self.alpha) * self.smoothed
-                };
-                self.last_bytes = bytes;
-                self.last_time = Some(now);
+        if let Some((_, last_bytes)) = self.samples.back().copied() {
+            if bytes < last_bytes {
+                self.samples.clear();
+                self.smoothed = 0.0;
             }
-        } else {
-            self.last_bytes = bytes;
-            self.last_time = Some(now);
         }
-        self.smoothed as u64
+
+        self.samples.push_back((now, bytes));
+        while self.samples.len() > 2 {
+            if let Some((first_time, _)) = self.samples.front().copied() {
+                if now.duration_since(first_time) > self.window {
+                    self.samples.pop_front();
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if self.samples.len() < 2 {
+            return self.smoothed.max(0.0) as u64;
+        }
+
+        let (first_time, first_bytes) = self.samples.front().copied().unwrap();
+        let (last_time, last_bytes) = self.samples.back().copied().unwrap();
+        let dt = last_time.duration_since(first_time).as_secs_f64();
+        if dt < 0.05 {
+            return self.smoothed.max(0.0) as u64;
+        }
+
+        let instant = last_bytes.saturating_sub(first_bytes) as f64 / dt;
+        let alpha = self.alpha.clamp(0.25, 0.60);
+        self.smoothed = if self.smoothed == 0.0 {
+            instant
+        } else {
+            alpha * instant + (1.0 - alpha) * self.smoothed
+        };
+        self.smoothed.max(0.0) as u64
     }
 }
 
@@ -294,16 +306,19 @@ fn adaptive_download_slots_mods() -> usize {
     cpu_count().clamp(3, 12)
 }
 
-fn adaptive_extract_inflight_batches() -> usize {
-    match cpu_count() {
-        0..=4 => 1,
-        5..=8 => 2,
-        _ => 3,
-    }
-}
-
 fn adaptive_rayon_threads() -> usize {
     cpu_count().clamp(2, 16)
+}
+
+/// Pool dédié à l'extraction : utilise la moitié des cœurs pour laisser
+/// du headroom à l'UI, à l'antivirus et aux autres processus.
+/// Plus rapide qu'un thread unique, sans saturer le CPU.
+fn extraction_pool() -> rayon::ThreadPool {
+    let threads = (cpu_count() / 2).clamp(2, 6);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap())
 }
 
 /// Builds a rayon thread pool sized for broad hardware coverage.
@@ -418,23 +433,12 @@ pub async fn download_game(
         return Ok(());
     }
 
-    // ── Phase 2: streaming download + extract pipeline ─────────────────────
-    //
-    // Instead of: [download ALL sections] → [extract ALL files]  (two-phase, bar resets)
-    // We do:      for each section that arrives → immediately extract its files
-    //
-    // This means download and extraction overlap, the progress bar advances
-    // monotonically from 0→100%, and the speed display never drops to 0 between phases.
-    //
-    // pipeline_total = total_compressed + total_uncompressed.
-    // global counter = global_dl (compressed bytes fetched) + global_ex (uncompressed bytes written).
-    // bar % = (global_dl + global_ex) / pipeline_total — always increasing.
-    let pipeline_total = pipeline_compressed.saturating_add(pipeline_uncompressed);
-    let global_dl    = Arc::new(AtomicU64::new(0));
-    let global_ex    = Arc::new(AtomicU64::new(0));
-    let global_files = Arc::new(AtomicU32::new(0));
+    // ── Phase 2: parallel section downloads ──────────────────────────────────
+    // Download all sections for all packages. Extraction is a separate phase
+    // that starts only after every section has been fetched.
+    let global_dl = Arc::new(AtomicU64::new(0));
 
-    // Pre-create all output directories before spawning extraction tasks.
+    // Pre-create all output directories.
     {
         let mut dirs = std::collections::HashSet::new();
         for pkg in &packages {
@@ -447,134 +451,62 @@ pub async fn download_game(
         for dir in dirs { std::fs::create_dir_all(dir).ok(); }
     }
 
-    // Single unified progress ticker — no second ticker, no phase transition.
-    let tick_app   = app.clone();
-    let tick_dl    = global_dl.clone();
-    let tick_ex    = global_ex.clone();
-    let tick_files = global_files.clone();
+    // Download progress ticker.
+    let tick_app     = app.clone();
+    let tick_dl      = global_dl.clone();
     let tick_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let tick_flag    = tick_running.clone();
     let tick_handle  = tokio::spawn(async move {
         let mut sw = SpeedEwma::new(0.10);
+        let mut last_bytes: u64 = 0;
+        let mut last_progress_at = std::time::Instant::now();
+        let mut last_nonzero_speed: u64 = 0;
         while tick_flag.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let dl         = tick_dl.load(Ordering::Relaxed);
-            let ex         = tick_ex.load(Ordering::Relaxed);
-            let files_done = tick_files.load(Ordering::Relaxed);
-            let total_done = dl.saturating_add(ex);
-            let speed      = sw.push(total_done);
-            let remaining  = pipeline_total.saturating_sub(total_done);
-            let eta        = if speed > 0 { remaining / speed } else { 0 };
-            // Status transitions naturally: "downloading" while sections are
-            // still being fetched, "extracting" only during the tail phase where
-            // all downloads are done but some large LZMA files are still processing.
-            let status = if dl < pipeline_compressed { "downloading" } else { "extracting" };
+            let dl    = tick_dl.load(Ordering::Relaxed);
+            if dl > last_bytes {
+                last_progress_at = std::time::Instant::now();
+            }
+            let raw_speed = sw.push(dl);
+            let remaining = pipeline_compressed.saturating_sub(dl);
+            let near_finish = remaining <= (pipeline_compressed / 40).max(32 * 1024 * 1024);
+            let speed = if raw_speed > 0 {
+                last_nonzero_speed = raw_speed;
+                raw_speed
+            } else if near_finish
+                && dl >= last_bytes
+                && last_nonzero_speed > 0
+                && last_progress_at.elapsed() <= std::time::Duration::from_secs(2)
+            {
+                // Avoid end-of-download speed collapsing to ~0 while final tasks flush.
+                last_nonzero_speed
+            } else {
+                raw_speed
+            };
+            let eta = if speed > 0 { remaining / speed } else { 0 };
             let _ = tick_app.emit("download-progress", DownloadEvent {
-                status: status.into(),
-                file_name: format!("{}/{} files", files_done, total_dl_files),
-                current_file: files_done,
+                status: "downloading".into(),
+                file_name: format!("0/{} files", total_dl_files),
+                current_file: 0,
                 total_files: total_dl_files,
-                downloaded_bytes: total_done,
-                total_bytes: pipeline_total,
+                downloaded_bytes: dl,
+                total_bytes: pipeline_compressed,
                 speed, eta, error: None,
             });
+            last_bytes = dl;
         }
     });
 
     // Semaphore shared across all packages (adaptive concurrency).
     let dl_sem = Arc::new(Semaphore::new(adaptive_download_slots_game()));
-    let mut all_errors: Vec<String> = Vec::new();
 
-    // ── Extraction worker ───────────────────────────────────────────────────
-    // Decoupled from the download loop via a channel: sending work is instant,
-    // so rx.recv() is never blocked by rayon/LZMA and sections keep arriving
-    // at full speed even when a large batch is being extracted.
+    // Collect extraction work items produced during download.
+    // Held in memory until all downloads complete, then extracted in Phase 3.
     type ExtractWork = (Vec<IndexFileEntry>, HashMap<u32, Arc<Vec<u8>>>);
-    let (extract_tx, mut extract_rx) = tokio::sync::mpsc::unbounded_channel::<ExtractWork>();
-    let ex_err_store: Arc<std::sync::Mutex<Vec<String>>> =
+    let work_batches: Arc<std::sync::Mutex<Vec<ExtractWork>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
-    // Single shared rayon pool for all extraction batches — avoids creating a
-    // new pool per batch (expensive) and prevents thread-count multiplication
-    // when multiple batches run concurrently.
-    let extract_pool = Arc::new({
-        let threads = adaptive_rayon_threads();
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap())
-    });
-    let extract_inflight = Arc::new(Semaphore::new(adaptive_extract_inflight_batches()));
-
-    let extract_worker = {
-        let gd        = game_dir.clone();
-        let ex_b      = global_ex.clone();
-        let ex_f      = global_files.clone();
-        let err_store = ex_err_store.clone();
-        let ex_sem = extract_inflight.clone();
-        tokio::spawn(async move {
-            // Dispatch every batch immediately without awaiting — all batches run
-            // concurrently on tokio's blocking pool, sharing the rayon pool.
-            // In-flight batch count is capped adaptively to avoid saturating
-            // low-end CPUs and spinning disks.
-            let mut batch_handles: Vec<tokio::task::JoinHandle<Vec<String>>> = Vec::new();
-            while let Some((files, secs)) = extract_rx.recv().await {
-                let gd2   = gd.clone();
-                let ex_b2 = ex_b.clone();
-                let ex_f2 = ex_f.clone();
-                let pool  = extract_pool.clone();
-                let permit = match ex_sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        err_store.lock().unwrap().push(e.to_string());
-                        break;
-                    }
-                };
-                batch_handles.push(tokio::spawn(async move {
-                    let _permit = permit;
-                    tokio::task::spawn_blocking(move || {
-                        use rayon::prelude::*;
-                        pool.install(|| {
-                            files.into_par_iter().filter_map(|entry| {
-                                let raw = match extract_raw_arc(&entry, &secs) {
-                                    Ok(r)  => r,
-                                    Err(e) => return Some(e),
-                                };
-                                let data = if is_lzma(&raw) {
-                                    decompress_lzma(&raw).unwrap_or(raw)
-                                } else { raw };
-                                let stripped = strip_first_component(&entry.path);
-                                let dest = if stripped.is_empty() {
-                                    gd2.join(&entry.file)
-                                } else {
-                                    gd2.join(stripped).join(&entry.file)
-                                };
-                                let written = data.len() as u64;
-                                if let Err(e) = std::fs::write(&dest, &data) {
-                                    return Some(format!("write {}: {}", entry.file, e));
-                                }
-                                ex_b2.fetch_add(written, Ordering::Relaxed);
-                                ex_f2.fetch_add(1, Ordering::Relaxed);
-                                None
-                            }).collect()
-                        })
-                    }).await.unwrap_or_else(|e| vec![e.to_string()])
-                }));
-            }
-            // Channel closed — wait for every batch to finish then collect errors.
-            let mut all_errs: Vec<String> = Vec::new();
-            for h in batch_handles {
-                match h.await {
-                    Ok(errs) => all_errs.extend(errs),
-                    Err(e)   => all_errs.push(e.to_string()),
-                }
-            }
-            err_store.lock().unwrap().extend(all_errs);
-        })
-    };
 
     // ── Parallel package downloads ───────────────────────────────────────────
-    // Every package spawns its own task; the shared semaphore caps the total
-    // number of concurrent section downloads across ALL packages at once.
     let pkg_err_store: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut pkg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -583,7 +515,7 @@ pub async fn download_game(
         let client    = client.clone();
         let dl_sem    = dl_sem.clone();
         let global_dl = global_dl.clone();
-        let etx       = extract_tx.clone();
+        let batches   = work_batches.clone();
         let err_store = pkg_err_store.clone();
 
         pkg_handles.push(tokio::spawn(async move {
@@ -688,7 +620,8 @@ pub async fn download_game(
                                 .collect()
                         };
 
-                        etx.send((ready_files, local_secs)).ok();
+                        // Queue for extraction after all downloads finish.
+                        batches.lock().unwrap().push((ready_files, local_secs));
 
                         let still_needed: std::collections::BTreeSet<u32> = pending
                             .iter().flat_map(|e| file_sections(e, cab_size)).collect();
@@ -700,16 +633,310 @@ pub async fn download_game(
     }
 
     for h in pkg_handles { let _ = h.await; }
+    let mut all_errors: Vec<String> = Vec::new();
     all_errors.extend(pkg_err_store.lock().unwrap().drain(..));
-
-    // Signal extraction worker that no more batches are coming, then await it
-    // so all in-flight spawn_blocking calls finish before we check errors.
-    drop(extract_tx);
-    let _ = extract_worker.await;
-    all_errors.extend(ex_err_store.lock().unwrap().drain(..));
 
     tick_running.store(false, Ordering::Relaxed);
     let _ = tick_handle.await;
+
+    if !all_errors.is_empty() {
+        return Err(all_errors.join("; "));
+    }
+
+    // ── Phase 3: extraction ──────────────────────────────────────────────────
+    // Flatten all batches into a single work list, then run ONE spawn_blocking
+    // + ONE rayon par_iter.  No per-batch task creation, no semaphore, no pool
+    // rebuilds — rayon can freely spread every file across all CPU cores.
+    // Each batch's section map is wrapped in Arc so all files in that batch
+    // share it with zero copies.
+    let batches = std::mem::take(&mut *work_batches.lock().unwrap());
+    let global_ex    = Arc::new(AtomicU64::new(0));
+    let global_files = Arc::new(AtomicU32::new(0));
+
+    let _ = app.emit("download-progress", DownloadEvent {
+        status: "extracting".into(),
+        file_name: format!("0/{} files", total_dl_files),
+        current_file: 0,
+        total_files: total_dl_files,
+        downloaded_bytes: 0,
+        total_bytes: pipeline_uncompressed,
+        speed: 0, eta: 0, error: None,
+    });
+
+    let tick_app2     = app.clone();
+    let tick_ex2      = global_ex.clone();
+    let tick_files2   = global_files.clone();
+    let tick_running2 = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let tick_flag2    = tick_running2.clone();
+    let tick_handle2  = tokio::spawn(async move {
+        let mut sw_bytes = SpeedEwma::new(0.20);
+        let mut sw_files = SpeedEwma::new(0.30);
+        let mut hist_bytes: VecDeque<(std::time::Instant, u64)> = VecDeque::with_capacity(64);
+        let mut hist_files: VecDeque<(std::time::Instant, u32)> = VecDeque::with_capacity(64);
+        let mut eta_smoothed: Option<f64> = None;
+        let mut last_ex: u64 = 0;
+        let mut last_files_done: u32 = 0;
+        let mut last_progress_at = std::time::Instant::now();
+        let mut last_nonzero_speed: u64 = 0;
+
+        fn slope_u64(samples: &VecDeque<(std::time::Instant, u64)>) -> f64 {
+            if samples.len() < 3 {
+                return 0.0;
+            }
+            let t0 = match samples.front() {
+                Some((t, _)) => *t,
+                None => return 0.0,
+            };
+            let n = samples.len() as f64;
+            let mut sum_x = 0.0;
+            let mut sum_y = 0.0;
+            let mut sum_xx = 0.0;
+            let mut sum_xy = 0.0;
+            for (t, y) in samples {
+                let x = t.duration_since(t0).as_secs_f64();
+                let yf = *y as f64;
+                sum_x += x;
+                sum_y += yf;
+                sum_xx += x * x;
+                sum_xy += x * yf;
+            }
+            let denom = n * sum_xx - sum_x * sum_x;
+            if denom <= 1e-9 {
+                return 0.0;
+            }
+            ((n * sum_xy - sum_x * sum_y) / denom).max(0.0)
+        }
+
+        fn slope_u32(samples: &VecDeque<(std::time::Instant, u32)>) -> f64 {
+            if samples.len() < 3 {
+                return 0.0;
+            }
+            let t0 = match samples.front() {
+                Some((t, _)) => *t,
+                None => return 0.0,
+            };
+            let n = samples.len() as f64;
+            let mut sum_x = 0.0;
+            let mut sum_y = 0.0;
+            let mut sum_xx = 0.0;
+            let mut sum_xy = 0.0;
+            for (t, y) in samples {
+                let x = t.duration_since(t0).as_secs_f64();
+                let yf = *y as f64;
+                sum_x += x;
+                sum_y += yf;
+                sum_xx += x * x;
+                sum_xy += x * yf;
+            }
+            let denom = n * sum_xx - sum_x * sum_x;
+            if denom <= 1e-9 {
+                return 0.0;
+            }
+            ((n * sum_xy - sum_x * sum_y) / denom).max(0.0)
+        }
+
+        while tick_flag2.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let now = std::time::Instant::now();
+            let ex         = tick_ex2.load(Ordering::Relaxed);
+            let files_done = tick_files2.load(Ordering::Relaxed);
+
+            hist_bytes.push_back((now, ex));
+            hist_files.push_back((now, files_done));
+            let max_window = std::time::Duration::from_secs(8);
+            while let Some((t, _)) = hist_bytes.front().copied() {
+                if now.duration_since(t) > max_window {
+                    hist_bytes.pop_front();
+                } else {
+                    break;
+                }
+            }
+            while let Some((t, _)) = hist_files.front().copied() {
+                if now.duration_since(t) > max_window {
+                    hist_files.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let byte_speed = sw_bytes.push(ex);
+            let files_per_sec = sw_files.push(files_done as u64) as f64;
+            let byte_speed_lr = slope_u64(&hist_bytes);
+            let files_per_sec_lr = slope_u32(&hist_files);
+
+            let byte_conf = ((hist_bytes.len().saturating_sub(2) as f64) / 10.0).clamp(0.0, 1.0);
+            let file_conf = ((hist_files.len().saturating_sub(2) as f64) / 10.0).clamp(0.0, 1.0);
+
+            let byte_speed_blend = if byte_speed_lr > 0.0 {
+                (0.75 * byte_speed_lr + 0.25 * byte_speed as f64).max(0.0)
+            } else {
+                byte_speed as f64
+            };
+            let files_per_sec_blend = if files_per_sec_lr > 0.0 {
+                (0.75 * files_per_sec_lr + 0.25 * files_per_sec).max(0.0)
+            } else {
+                files_per_sec.max(0.0)
+            };
+            let avg_bytes_per_file = if files_done > 0 {
+                ex as f64 / files_done as f64
+            } else {
+                0.0
+            };
+
+            let fallback_speed = if byte_speed_blend <= 1.0 && files_per_sec_blend > 0.0 && avg_bytes_per_file > 0.0 {
+                (files_per_sec_blend * avg_bytes_per_file) as u64
+            } else {
+                0
+            };
+            let mut effective_speed = (byte_speed_blend as u64).max(fallback_speed);
+
+            let estimated_total_from_files = if files_done > 0 {
+                (avg_bytes_per_file * total_dl_files as f64) as u64
+            } else {
+                0
+            };
+            let estimated_total = pipeline_uncompressed
+                .max(estimated_total_from_files)
+                .max(ex);
+
+            if ex > last_ex || files_done > last_files_done {
+                last_progress_at = now;
+            }
+            let near_finish =
+                estimated_total.saturating_sub(ex) <= (pipeline_uncompressed / 40).max(32 * 1024 * 1024)
+                || total_dl_files.saturating_sub(files_done) <= 3;
+            if effective_speed > 0 {
+                last_nonzero_speed = effective_speed;
+            } else if near_finish
+                && last_nonzero_speed > 0
+                && last_progress_at.elapsed() <= std::time::Duration::from_secs(2)
+            {
+                // Near completion, extraction can briefly pause while final writes/join happen.
+                // Keep displaying the last observed speed to avoid a fake "stopped then resumed" effect.
+                effective_speed = last_nonzero_speed;
+            }
+
+            let eta_bytes = if effective_speed > 0 && estimated_total > ex {
+                (estimated_total - ex) as f64 / effective_speed as f64
+            } else {
+                0.0
+            };
+            let eta_files = if files_per_sec_blend > 0.0 && total_dl_files > files_done {
+                (total_dl_files - files_done) as f64 / files_per_sec_blend
+            } else {
+                0.0
+            };
+            let eta_raw = match (eta_bytes > 0.0, eta_files > 0.0) {
+                (false, false) => 0.0,
+                (true, false) => eta_bytes,
+                (false, true) => eta_files,
+                (true, true) => {
+                    let wb = 0.60 + 0.40 * byte_conf;
+                    let wf = 0.40 + 0.40 * file_conf;
+                    (eta_bytes * wb + eta_files * wf) / (wb + wf)
+                }
+            };
+
+            let eta = if eta_raw <= 0.0 {
+                eta_smoothed = None;
+                0
+            } else {
+                let prev = eta_smoothed.unwrap_or(eta_raw);
+                let near_end = estimated_total.saturating_sub(ex) < 32 * 1024 * 1024;
+                let alpha = if near_end {
+                    0.55
+                } else if eta_raw < prev {
+                    0.40
+                } else {
+                    0.22
+                };
+                let mut smoothed = alpha * eta_raw + (1.0 - alpha) * prev;
+                let max_up = prev * 1.15 + 1.0;
+                if smoothed > max_up {
+                    smoothed = max_up;
+                }
+                eta_smoothed = Some(smoothed);
+                smoothed.round() as u64
+            };
+
+            let _ = tick_app2.emit("download-progress", DownloadEvent {
+                status: "extracting".into(),
+                file_name: format!("{}/{} files", files_done, total_dl_files),
+                current_file: files_done,
+                total_files: total_dl_files,
+                downloaded_bytes: ex,
+                total_bytes: pipeline_uncompressed,
+                speed: effective_speed,
+                eta,
+                error: None,
+            });
+            last_ex = ex;
+            last_files_done = files_done;
+        }
+    });
+
+    // Build the flat work list (one entry per file, shared section map via Arc).
+    type FlatItem = (IndexFileEntry, Arc<HashMap<u32, Arc<Vec<u8>>>>);
+    let mut flat: Vec<FlatItem> = Vec::with_capacity(total_dl_files as usize);
+    for (files, secs) in batches {
+        let secs = Arc::new(secs);
+        for entry in files {
+            flat.push((entry, secs.clone()));
+        }
+    }
+
+    let gd   = game_dir.clone();
+    let ex_b = global_ex.clone();
+    let ex_f = global_files.clone();
+    let extract_errors: Vec<String> = tokio::task::spawn_blocking(move || {
+        use rayon::prelude::*;
+        use std::io::BufWriter;
+        // extraction_pool() utilise ~moitié des cœurs: rapide mais non-saturant.
+        extraction_pool().install(|| {
+            flat.into_par_iter().filter_map(|(entry, secs)| {
+                let raw = match extract_raw_arc(&entry, &secs) {
+                    Ok(r)  => r,
+                    Err(e) => return Some(e),
+                };
+                let data: Vec<u8> = if is_lzma(&raw) {
+                    let mut out = Vec::with_capacity(entry.length as usize);
+                    let mut reader = Cursor::new(&raw[..]);
+                    match lzma_decompress(&mut reader, &mut out) {
+                        Ok(_) => out,
+                        Err(_) => raw,
+                    }
+                } else {
+                    raw
+                };
+                let stripped = strip_first_component(&entry.path);
+                let dest = if stripped.is_empty() {
+                    gd.join(&entry.file)
+                } else {
+                    gd.join(stripped).join(&entry.file)
+                };
+                let written = data.len() as u64;
+                // BufWriter évite les allers-retours syscall pour les fichiers
+                // de petite taille qui arrivent par morceaux.
+                let result = (|| -> std::io::Result<()> {
+                    let f = std::fs::File::create(&dest)?;
+                    let mut w = BufWriter::with_capacity(256 * 1024, f);
+                    std::io::Write::write_all(&mut w, &data)?;
+                    w.flush()
+                })();
+                if let Err(e) = result {
+                    return Some(format!("write {}: {}", entry.file, e));
+                }
+                ex_b.fetch_add(written, Ordering::Relaxed);
+                ex_f.fetch_add(1, Ordering::Relaxed);
+                None
+            }).collect()
+        })
+    }).await.unwrap_or_else(|e| vec![e.to_string()]);
+
+    all_errors.extend(extract_errors);
+
+    tick_running2.store(false, Ordering::Relaxed);
+    let _ = tick_handle2.await;
 
     if !all_errors.is_empty() {
         return Err(all_errors.join("; "));
@@ -719,7 +946,7 @@ pub async fn download_game(
         status: "completed".into(),
         file_name: "Download complete".into(),
         current_file: total_dl_files, total_files: total_dl_files,
-        downloaded_bytes: pipeline_total, total_bytes: pipeline_total,
+        downloaded_bytes: pipeline_uncompressed, total_bytes: pipeline_uncompressed,
         speed: 0, eta: 0, error: None,
     });
 
@@ -1013,7 +1240,7 @@ fn sha256_hex_file(path: &Path) -> Result<String, String> {
     use sha2::{Sha256, Digest as Sha2Digest};
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = [0u8; 262144];
     loop {
         let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if n == 0 { break; }
@@ -1083,25 +1310,58 @@ pub async fn download_modnet_modules(
         downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
     });
 
+    let verified_count = Arc::new(AtomicU32::new(0));
+    let verify_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let vr_flag = verify_running.clone();
+    let vr_count = verified_count.clone();
+    let vr_app = app.clone();
+    let verify_tick = tokio::spawn(async move {
+        let frames = ["", ".", "..", "..."];
+        let mut i = 0usize;
+        while vr_flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+            let done = vr_count.load(Ordering::Relaxed).min(total);
+            let _ = vr_app.emit("download-progress", DownloadEvent {
+                status: "verifying".into(),
+                file_name: format!("Checking ModNet modules{}", frames[i % frames.len()]),
+                current_file: done,
+                total_files: total,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                speed: 0,
+                eta: 0,
+                error: None,
+            });
+            i = i.wrapping_add(1);
+        }
+    });
+
     // Parallel SHA-256 check via rayon.
     let game_dir_c = game_dir.clone();
     let modules_vec: Vec<(String, String)> = modules.into_iter().collect();
     let modules_len = modules_vec.len();
     let modules_vec_c = modules_vec.clone();
+    let verified_count_c = verified_count.clone();
     let needs_vec: Vec<bool> = tokio::task::spawn_blocking(move || {
         use rayon::prelude::*;
         let pool = limited_pool();
         pool.install(|| {
             modules_vec_c.par_iter().map(|(name, expected)| {
                 let path = game_dir_c.join(name);
-                if path.exists() {
-                    sha256_hex_file(&path).map(|actual| actual != *expected).unwrap_or(true)
+                let needs = if path.exists() {
+                    sha256_hex_file(&path)
+                        .map(|actual| !actual.eq_ignore_ascii_case(expected))
+                        .unwrap_or(true)
                 } else {
                     true
-                }
+                };
+                verified_count_c.fetch_add(1, Ordering::Relaxed);
+                needs
             }).collect()
         })
     }).await.unwrap_or_else(|_| vec![true; modules_len]);
+    verify_running.store(false, Ordering::Relaxed);
+    let _ = verify_tick.await;
 
     let dlls_to_download: Vec<String> = modules_vec.into_iter()
         .zip(needs_vec)
@@ -1148,11 +1408,17 @@ pub async fn download_modnet_modules(
     let p_flag = progress_running.clone();
     let progress_handle = tokio::spawn(async move {
         let mut sw = SpeedEwma::new(0.10);
+        let mut last_bytes: u64 = 0;
+        let mut last_progress_at = std::time::Instant::now();
+        let mut last_nonzero_speed: u64 = 0;
         while p_flag.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let done = p_done.load(Ordering::Relaxed);
             let bytes = p_bytes.load(Ordering::Relaxed);
-            let speed = sw.push(bytes);
+            if bytes > last_bytes {
+                last_progress_at = std::time::Instant::now();
+            }
+            let raw_speed = sw.push(bytes);
             // When HEAD gave no size info (known_total == 0), emit total_bytes: 0
             // total_bytes=0 triggers the file-count % fallback in the UI;
             // downloaded_bytes always carries the real value so the size display works.
@@ -1166,6 +1432,19 @@ pub async fn download_modnet_modules(
                 0
             };
             let emit_total = if total_known > 0 { estimated_total } else { 0 };
+            let near_finish = estimated_total.saturating_sub(bytes)
+                <= (estimated_total / 40).max(16 * 1024 * 1024);
+            let speed = if raw_speed > 0 {
+                last_nonzero_speed = raw_speed;
+                raw_speed
+            } else if near_finish
+                && last_nonzero_speed > 0
+                && last_progress_at.elapsed() <= std::time::Duration::from_secs(2)
+            {
+                last_nonzero_speed
+            } else {
+                raw_speed
+            };
             let eta = if speed > 0 && estimated_total > bytes {
                 ((estimated_total - bytes) as f64 / speed as f64) as u64
             } else {
@@ -1178,6 +1457,7 @@ pub async fn download_modnet_modules(
                 downloaded_bytes: bytes, total_bytes: emit_total,
                 speed, eta, error: None,
             });
+            last_bytes = bytes;
         }
     });
 
@@ -1331,7 +1611,7 @@ fn normalize_entry_name(name: &str) -> String {
 fn sha1_hex_file(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha1::new();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = [0u8; 262144];
     loop {
         let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
         if n == 0 { break; }
@@ -1340,45 +1620,29 @@ fn sha1_hex_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn materialize_mod_data_dir(
-    cache_dir: &Path,
-    data_dir: &Path,
-    entries: &[ModListEntry],
-) -> Result<(), String> {
-    if data_dir.exists() {
-        std::fs::remove_dir_all(data_dir)
-            .map_err(|e| format!("Failed to reset {}: {}", data_dir.display(), e))?;
-    }
-
-    for entry in entries {
-        let Some(raw_name) = entry.name.as_ref().filter(|name| !name.trim().is_empty()) else {
-            continue;
+/// Returns the number of hard links pointing to the same inode as `path`.
+/// A value >= 2 means at least one other directory entry (e.g. in `.data/<hash>/`)
+/// still references the same file — i.e. ModManager's hardlink is still in place.
+/// Returns 1 on any error (safe default: assume the file is not a hardlink).
+fn get_hardlink_count(path: &Path) -> u32 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
         };
-        let name = normalize_entry_name(raw_name);
-        let name = name.as_str();
-
-        let relative_path = Path::new(name);
-        let source_path = cache_dir.join(relative_path);
-        if !source_path.exists() {
-            return Err(format!("Missing cached mod file: {}", source_path.display()));
-        }
-
-        let target_path = data_dir.join(relative_path);
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
-        }
-
-        match std::fs::hard_link(&source_path, &target_path) {
-            Ok(_) => {}
-            Err(_) => {
-                std::fs::copy(&source_path, &target_path)
-                    .map_err(|e| format!("Failed to materialize {}: {}", target_path.display(), e))?;
-            }
-        }
+        let Ok(file) = std::fs::File::open(path) else { return 1 };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+        if ok == 0 { return 1 }
+        info.nNumberOfLinks
     }
 
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.nlink() as u32).unwrap_or(1)
+    }
 }
 
 fn remove_path_safely(path: &Path) {
@@ -1420,15 +1684,6 @@ fn remove_path_safely(path: &Path) {
     }
 }
 
-fn normalize_link_target(path: PathBuf) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if let Some(stripped) = raw.strip_prefix("\\\\?\\") {
-        PathBuf::from(stripped)
-    } else {
-        PathBuf::from(raw.as_ref())
-    }
-}
-
 fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -1444,117 +1699,7 @@ fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-fn resolves_into_mod_runtime(path: &Path, base_dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
-    let Some(target) = std::fs::read_link(path)
-        .ok()
-        .map(normalize_link_target)
-        .map(|target| {
-            if target.is_absolute() {
-                target
-            } else {
-                path.parent().unwrap_or(base_dir).join(target)
-            }
-        }) else {
-        return false;
-    };
-
-    target.starts_with(mods_dir) || target.starts_with(data_root_dir)
-}
-
-fn is_runtime_reparse_point(path: &Path, base_dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if is_reparse_point(&meta) => {
-            resolves_into_mod_runtime(path, base_dir, mods_dir, data_root_dir)
-                || (!path.starts_with(mods_dir) && !path.starts_with(data_root_dir))
-        }
-        _ => false,
-    }
-}
-
-fn has_runtime_mod_links(dir: &Path, mods_dir: &Path, data_root_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.starts_with(mods_dir) || path.starts_with(data_root_dir) {
-            continue;
-        }
-
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-        if is_reparse_point(&meta) {
-            if is_runtime_reparse_point(&path, dir, mods_dir, data_root_dir) {
-                return true;
-            }
-            continue;
-        }
-
-        if meta.is_dir() && has_runtime_mod_links(&path, mods_dir, data_root_dir) {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn has_orig_files_outside_runtime(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else { return false };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-
-        if meta.is_dir() {
-            let skip_dir = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| matches!(name, "MODS" | ".data"))
-                .unwrap_or(false);
-            if skip_dir || is_reparse_point(&meta) {
-                continue;
-            }
-            if has_orig_files_outside_runtime(&path) {
-                return true;
-            }
-            continue;
-        }
-
-        if path.extension().and_then(|e| e.to_str()) == Some("orig") {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn remove_runtime_mod_links(dir: &Path, mods_dir: &Path, data_root_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.starts_with(mods_dir) || path.starts_with(data_root_dir) {
-            continue;
-        }
-
-        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-        let is_link = is_reparse_point(&meta);
-
-        if is_link {
-            if is_runtime_reparse_point(&path, dir, mods_dir, data_root_dir) {
-                remove_path_safely(&path);
-            }
-
-            continue;
-        }
-
-        if meta.is_dir() {
-            remove_runtime_mod_links(&path, mods_dir, data_root_dir);
-        }
-    }
-}
-
-fn prune_runtime_cache_orig_files(dir: &Path) {
+fn prune_runtime_cache_reparse_points(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
 
     for entry in entries.flatten() {
@@ -1566,12 +1711,7 @@ fn prune_runtime_cache_orig_files(dir: &Path) {
                 remove_path_safely(&path);
                 continue;
             }
-            prune_runtime_cache_orig_files(&path);
-            continue;
-        }
-
-        if path.extension().and_then(|e| e.to_str()) == Some("orig") {
-            std::fs::remove_file(&path).ok();
+            prune_runtime_cache_reparse_points(&path);
         }
     }
 }
@@ -1583,13 +1723,12 @@ pub fn has_pending_mod_cleanup(game_path: String) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let mods_dir = game_dir.join("MODS");
-    let data_root_dir = game_dir.join(".data");
     let modules_dir = game_dir.join("modules");
     let links_file = game_dir.join(".links");
+    let snapshot_path = game_dir.join(".scripts_snapshot");
     let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
 
-    if links_file.exists() || modules_dir.exists() {
+    if links_file.exists() || modules_dir.exists() || snapshot_path.exists() {
         return Ok(true);
     }
 
@@ -1597,11 +1736,7 @@ pub fn has_pending_mod_cleanup(game_path: String) -> Result<bool, String> {
         return Ok(true);
     }
 
-    if has_orig_files_outside_runtime(&game_dir) {
-        return Ok(true);
-    }
-
-    Ok(has_runtime_mod_links(&game_dir, &mods_dir, &data_root_dir))
+    Ok(false)
 }
 
 #[command]
@@ -1673,12 +1808,39 @@ pub async fn download_mods(
         downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
     });
 
+    let verified_count = Arc::new(AtomicU32::new(0));
+    let verify_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let vr_flag = verify_running.clone();
+    let vr_count = verified_count.clone();
+    let vr_app = app.clone();
+    let verify_tick = tokio::spawn(async move {
+        let frames = ["", ".", "..", "..."];
+        let mut i = 0usize;
+        while vr_flag.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+            let done = vr_count.load(Ordering::Relaxed).min(total_mods);
+            let _ = vr_app.emit("download-progress", DownloadEvent {
+                status: "verifying".into(),
+                file_name: format!("Verifying mods{}", frames[i % frames.len()]),
+                current_file: done,
+                total_files: total_mods,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                speed: 0,
+                eta: 0,
+                error: None,
+            });
+            i = i.wrapping_add(1);
+        }
+    });
+
     let entries_vec: Vec<(String, Option<String>)> = entries.iter()
         .map(|e| (normalize_entry_name(&e.name.clone().unwrap_or_default()), e.checksum.clone()))
         .collect();
 
     // Parallel verification via rayon (same pattern as download_game verify phase).
     let cache_dir_c = cache_dir.clone();
+    let verified_count_c = verified_count.clone();
     let needs_vec: Vec<(bool, bool)> = tokio::task::spawn_blocking(move || {
         use rayon::prelude::*;
         let pool = limited_pool();
@@ -1686,20 +1848,25 @@ pub async fn download_mods(
             entries_vec.into_par_iter().map(|(name, expected)| {
                 let cached_file = cache_dir_c.join(&name);
                 if !cached_file.exists() {
+                    verified_count_c.fetch_add(1, Ordering::Relaxed);
                     return (true, false);
                 }
-                match expected {
+                let out = match expected {
                     Some(exp) => {
                         let mismatch = sha1_hex_file(&cached_file)
-                            .map(|actual| actual != exp.to_lowercase())
+                            .map(|actual| !actual.eq_ignore_ascii_case(&exp))
                             .unwrap_or(true);
                         (mismatch, mismatch)
                     }
                     None => (false, false),
-                }
+                };
+                verified_count_c.fetch_add(1, Ordering::Relaxed);
+                out
             }).collect()
         })
     }).await.unwrap_or_else(|_| vec![(true, false); entries.len()]);
+    verify_running.store(false, Ordering::Relaxed);
+    let _ = verify_tick.await;
 
     let mut mods_to_download: Vec<(String, String)> = Vec::new(); // (original_name, local_name)
     let mut any_mismatch = false;
@@ -1719,14 +1886,46 @@ pub async fn download_mods(
         downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
     });
 
-    if mods_to_download.is_empty() {
+    // If the server's mod set changed, clear the extracted cache now so the
+    // expensive directory removal does not happen after the download phase.
+    if any_mismatch && data_dir.exists() {
         let _ = app.emit("download-progress", DownloadEvent {
-            status: "extracting".into(),
-            file_name: "Materializing mods...".into(),
-            current_file: total_mods, total_files: total_mods,
-            downloaded_bytes: 0, total_bytes: 0, speed: 0, eta: 0, error: None,
+            status: "finalizing".into(),
+            file_name: "Preparing updated mods...".into(),
+            current_file: total_mods,
+            total_files: total_mods,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            speed: 0,
+            eta: 0,
+            error: None,
         });
-        materialize_mod_data_dir(&cache_dir, &data_dir, &entries)?;
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    // Delete stale cache files that are no longer in the new index.
+    // This mirrors the reference launcher's "File.Delete(file)" for entries not in json3.
+    if cache_dir.exists() {
+        let expected_names: std::collections::HashSet<String> = entries.iter()
+            .filter_map(|e| e.name.as_deref())
+            .map(normalize_entry_name)
+            .collect();
+        if let Ok(dir_iter) = std::fs::read_dir(&cache_dir) {
+            for entry in dir_iter.flatten() {
+                let p = entry.path();
+                if !p.is_file() { continue; }
+                let name = p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !expected_names.contains(&name) {
+                    std::fs::remove_file(&p).ok();
+                }
+            }
+        }
+    }
+
+    if mods_to_download.is_empty() {
         let _ = app.emit("download-progress", DownloadEvent {
             status: "completed".into(),
             file_name: "Mods ready".into(),
@@ -1760,11 +1959,17 @@ pub async fn download_mods(
     let p_flag = progress_running.clone();
     let progress_handle = tokio::spawn(async move {
         let mut sw = SpeedEwma::new(0.10);
+        let mut last_bytes: u64 = 0;
+        let mut last_progress_at = std::time::Instant::now();
+        let mut last_nonzero_speed: u64 = 0;
         while p_flag.load(Ordering::Relaxed) {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let done = p_done.load(Ordering::Relaxed);
             let bytes = p_bytes.load(Ordering::Relaxed);
-            let speed = sw.push(bytes);
+            if bytes > last_bytes {
+                last_progress_at = std::time::Instant::now();
+            }
+            let raw_speed = sw.push(bytes);
             // Same guard as ModNet: total_bytes=0 → file-count fallback for %; real bytes always shown.
             let total_known = p_total.load(Ordering::Relaxed);
             let estimated_total = if total_known > 0 {
@@ -1776,6 +1981,19 @@ pub async fn download_mods(
                 0
             };
             let emit_total = if total_known > 0 { estimated_total } else { 0 };
+            let near_finish = estimated_total.saturating_sub(bytes)
+                <= (estimated_total / 40).max(16 * 1024 * 1024);
+            let speed = if raw_speed > 0 {
+                last_nonzero_speed = raw_speed;
+                raw_speed
+            } else if near_finish
+                && last_nonzero_speed > 0
+                && last_progress_at.elapsed() <= std::time::Duration::from_secs(2)
+            {
+                last_nonzero_speed
+            } else {
+                raw_speed
+            };
             let eta = if speed > 0 && estimated_total > bytes {
                 ((estimated_total - bytes) as f64 / speed as f64) as u64
             } else {
@@ -1788,6 +2006,7 @@ pub async fn download_mods(
                 downloaded_bytes: bytes, total_bytes: emit_total,
                 speed, eta, error: None,
             });
+            last_bytes = bytes;
         }
     });
 
@@ -1900,20 +2119,6 @@ pub async fn download_mods(
         return Err(errors.join("; "));
     }
 
-    if any_mismatch {
-        if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir).ok();
-        }
-    }
-
-    let _ = app.emit("download-progress", DownloadEvent {
-        status: "extracting".into(),
-        file_name: "Materializing mods...".into(),
-        current_file: dl_total, total_files: dl_total,
-        downloaded_bytes: final_bytes, total_bytes: final_bytes.max(1),
-        speed: 0, eta: 0, error: None,
-    });
-    materialize_mod_data_dir(&cache_dir, &data_dir, &entries)?;
     let _ = app.emit("download-progress", DownloadEvent {
         status: "completed".into(),
         file_name: "Mods downloaded".into(),
@@ -1926,105 +2131,177 @@ pub async fn download_mods(
 }
 
 
-#[command]
-pub fn clean_mods(game_path: String) -> Result<(), String> {
-    let game_dir = PathBuf::from(&game_path);
+fn clean_mods_internal(game_dir: &Path) -> Result<bool, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use rayon::prelude::*;
+
     let links_file = game_dir.join(".links");
     let mods_dir = game_dir.join("MODS");
     let data_root_dir = game_dir.join(".data");
+    let log_path = game_dir.join(".cleanup_log");
 
     if links_file.exists() {
-        if let Ok(content) = std::fs::read_to_string(&links_file) {
-            for line in content.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() < 2 {
-                    continue;
-                }
-                let loc = parts[0];
-                let link_type: i32 = parts[1].parse().unwrap_or(-1);
+        let content = std::fs::read_to_string(&links_file)
+            .map_err(|e| format!("read .links: {}", e))?;
 
-                let real_loc = if std::path::Path::new(loc).is_absolute() {
-                    PathBuf::from(loc)
+        // Parse entries (sequential, fast string ops).
+        // Format: "<path>\t<type>" where type 0 = file replacement, 1 = directory junction.
+        // Legacy single-field format (no tab) is also accepted: type is inferred from path.
+        let entries: Vec<(u8, PathBuf)> = content.lines().filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let loc = parts.next()?.trim();
+            if loc.is_empty() { return None; }
+
+            let entry_type: u8 = match parts.next() {
+                Some(t) => t.trim().parse().ok()?,
+                // Legacy: no type field — infer from whether the path looks like a directory path
+                // (no file extension) or a file (has extension).
+                None => if Path::new(loc).extension().is_none() { 1 } else { 0 },
+            };
+
+            let real_loc = if Path::new(loc).is_absolute() {
+                PathBuf::from(loc)
+            } else {
+                game_dir.join(loc)
+            };
+            // Skip paths inside the mod cache directories.
+            if real_loc.starts_with(&mods_dir) || real_loc.starts_with(&data_root_dir) {
+                return None;
+            }
+            Some((entry_type, real_loc))
+        }).collect();
+
+        let has_recoverable = AtomicBool::new(false);
+
+        // Process all entries in parallel.  Each entry touches a distinct path so
+        // there are no cross-entry dependencies.
+        // Returns per-entry log lines.
+        let all_log: Vec<String> = {
+            let mut header = vec![format!(
+                "=== clean_mods_internal start, {} entries ===", entries.len()
+            )];
+            let per_entry: Vec<Vec<String>> = entries.par_iter().map(|(entry_type, real_loc)| {
+                let mut log = Vec::new();
+
+                if *entry_type == 0 {
+                    // ── type 0: file replacement ──────────────────────────────────────────────
+                    //
+                    // On Windows, std::fs::rename calls MoveFileExW(MOVEFILE_REPLACE_EXISTING),
+                    // which atomically replaces the destination in a single kernel call.
+                    // This means we do NOT need a separate remove_file step: if .orig exists we
+                    // just rename .orig → path, whether path currently exists (mod hardlink/copy)
+                    // or not (already cleaned up) — both cases are handled correctly.
+
+                    let orig_path = {
+                        let mut s = real_loc.as_os_str().to_os_string();
+                        s.push(".orig");
+                        PathBuf::from(s)
+                    };
+
+                    if orig_path.is_file() {
+                        // Primary path: atomic restore.
+                        log.push(format!("  [F] RESTORE {} -> {}", orig_path.display(), real_loc.display()));
+                        match std::fs::rename(&orig_path, real_loc) {
+                            Ok(()) => log.push("    OK".into()),
+                            Err(e) if e.raw_os_error() == Some(5) => {
+                                // Access denied — AV or the game process still has file open.
+                                // Keep .links → retry loop will call us again in 500ms.
+                                has_recoverable.store(true, Ordering::Relaxed);
+                                log.push(format!("    PENDING (access denied, will retry): {}", e));
+                            }
+                            Err(e) => {
+                                // .orig vanished between check and rename, or other transient error.
+                                // If the target already exists, ModManager restored it concurrently.
+                                if real_loc.is_file() {
+                                    log.push("    SKIP: target already present (concurrent restore)".into());
+                                } else {
+                                    log.push(format!("    WARN: rename failed: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        // No .orig.  Two cases:
+                        //   nlinks >= 2 → path is still the mod hardlink (no .orig was written,
+                        //                  e.g. ModManager crashed) → remove it.
+                        //   nlinks == 1 → either already restored by a prior cleanup run,
+                        //                  or was installed as a copy with no hardlink partner.
+                        let exists = real_loc.is_file() || {
+                            // Also count reparse points that aren't regular files.
+                            real_loc.symlink_metadata().is_ok()
+                        };
+                        if !exists {
+                            log.push(format!("  [F] NOT FOUND (already cleaned): {}", real_loc.display()));
+                        } else {
+                            let nlinks = get_hardlink_count(real_loc);
+                            if nlinks >= 2 {
+                                log.push(format!("  [F] REMOVE (nlinks={}, no .orig): {}", nlinks, real_loc.display()));
+                                match std::fs::remove_file(real_loc) {
+                                    Ok(()) => {}
+                                    Err(e) if e.raw_os_error() == Some(5) => {
+                                        has_recoverable.store(true, Ordering::Relaxed);
+                                        log.push("    PENDING (access denied, will retry)".into());
+                                    }
+                                    Err(e) => log.push(format!("    WARN: remove failed: {}", e)),
+                                }
+                            } else {
+                                log.push(format!("  [F] SKIP (nlinks=1, already restored): {}", real_loc.display()));
+                            }
+                        }
+                    }
                 } else {
-                    game_dir.join(loc)
-                };
+                    // ── type 1: directory junction ────────────────────────────────────────────
+                    #[cfg(windows)]
+                    let is_rp = real_loc.symlink_metadata().map(|m| {
+                        use std::os::windows::fs::MetadataExt;
+                        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                        (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    }).unwrap_or(false);
+                    #[cfg(not(windows))]
+                    let is_rp = real_loc.symlink_metadata()
+                        .map(|m| m.file_type().is_symlink()).unwrap_or(false);
 
-                if real_loc.starts_with(&mods_dir) || real_loc.starts_with(&data_root_dir) {
-                    continue;
+                    let dir_exists = real_loc.is_dir() || is_rp;
+                    if !dir_exists {
+                        log.push(format!("  [D] NOT FOUND (already cleaned): {}", real_loc.display()));
+                    } else if is_rp {
+                        log.push(format!("  [D] REMOVE (junction): {}", real_loc.display()));
+                        let r = std::fs::remove_dir(real_loc).or_else(|_| std::fs::remove_file(real_loc));
+                        if let Err(e) = r {
+                            if e.raw_os_error() == Some(5) {
+                                has_recoverable.store(true, Ordering::Relaxed);
+                                log.push("    PENDING (access denied, will retry)".into());
+                            } else {
+                                log.push(format!("    WARN: remove failed: {}", e));
+                            }
+                        }
+                    } else {
+                        // Plain directory (shouldn't happen for mod dirs, but handle gracefully).
+                        log.push(format!("  [D] REMOVE (plain dir): {}", real_loc.display()));
+                        std::fs::remove_dir_all(real_loc).ok();
+                    }
                 }
 
-                let orig_path = {
-                    let mut p = real_loc.as_os_str().to_os_string();
-                    p.push(".orig");
-                    PathBuf::from(p)
-                };
+                log
+            }).collect();
 
-                if link_type == 0 {
-                    if real_loc.exists() || real_loc.symlink_metadata().is_ok() {
-                        remove_path_safely(&real_loc);
-                    }
-                    // Use symlink_metadata so broken-symlink .orig files are caught too.
-                    if orig_path.symlink_metadata().is_ok() {
-                        std::fs::rename(&orig_path, &real_loc).ok();
-                    }
-                } else if link_type == 1 {
-                    if real_loc.exists() || real_loc.symlink_metadata().is_ok() {
-                        remove_path_safely(&real_loc);
-                    }
-                }
-            }
-        }
-        std::fs::remove_file(&links_file).ok();
-    }
+            header.extend(per_entry.into_iter().flatten());
+            let recoverable = has_recoverable.load(Ordering::Relaxed);
+            header.push(format!("=== cleanup done, has_recoverable={} ===", recoverable));
+            header
+        };
 
-    fn restore_orig_files(dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if meta.is_dir() {
-                if let Some(original_name) = file_name.strip_suffix(".orig") {
-                    let mut original = path.clone();
-                    original.set_file_name(original_name);
-                    // Whatever is at the target (junction, real dir, absent) — remove
-                    // it and restore the backup. If the rename already happened, no
-                    // .orig would be present, so seeing .orig always means "not yet restored".
-                    if original.symlink_metadata().is_ok() {
-                        remove_path_safely(&original);
-                    }
-                    std::fs::rename(&path, &original).ok();
-                    continue;
-                }
-                let skip_dir = matches!(file_name, "MODS" | ".data");
-                if skip_dir || is_reparse_point(&meta) {
-                    continue;
-                }
-                restore_orig_files(&path);
-                continue;
-            }
-            // File backed up as "filename.ext.orig" or "filename.orig".
-            // If .orig still exists the original was never restored — always restore.
-            if let Some(original_name) = file_name.strip_suffix(".orig") {
-                let mut original = path.clone();
-                original.set_file_name(original_name);
-                if original.symlink_metadata().is_ok() {
-                    remove_path_safely(&original);
-                }
-                std::fs::rename(&path, &original).ok();
-            }
+        let _ = std::fs::write(&log_path, all_log.join("\n"));
+
+        // Keep .links if any entry was temporarily locked — the retry loop will call us again.
+        if !has_recoverable.load(Ordering::Relaxed) {
+            std::fs::remove_file(&links_file).ok();
         }
     }
-    // Remove all mod junctions/symlinks FIRST so that restore_orig_files never
-    // encounters a live reparse point at the restore target — preventing the
-    // race where the rename fails silently while the junction is still there.
-    remove_runtime_mod_links(&game_dir, &mods_dir, &data_root_dir);
-    restore_orig_files(&game_dir);
     if mods_dir.exists() {
-        prune_runtime_cache_orig_files(&mods_dir);
+        prune_runtime_cache_reparse_points(&mods_dir);
     }
     if data_root_dir.exists() {
-        prune_runtime_cache_orig_files(&data_root_dir);
+        prune_runtime_cache_reparse_points(&data_root_dir);
     }
 
     let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
@@ -2066,7 +2343,24 @@ pub fn clean_mods(game_path: String) -> Result<(), String> {
     }
     std::fs::remove_file(&snapshot_path).ok();
 
-    Ok(())
+    let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
+    let still_pending = links_file.exists()
+        || modules_dir.exists()
+        || snapshot_path.exists()
+        || artifacts.iter().any(|artifact| game_dir.join(artifact).exists())
+        ;
+
+    Ok(still_pending)
+}
+
+pub(crate) fn clean_mods_and_check_pending(game_path: &str) -> Result<bool, String> {
+    let game_dir = PathBuf::from(game_path);
+    clean_mods_internal(&game_dir)
+}
+
+#[command]
+pub fn clean_mods(game_path: String) -> Result<(), String> {
+    clean_mods_and_check_pending(&game_path).map(|_| ())
 }
 
 

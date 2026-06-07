@@ -102,7 +102,7 @@ export function SettingsScreen() {
   const [autoVerifyStatus, setAutoVerifyStatus] = useState<"idle" | "verifying" | "repairing" | "done" | "error">("idle");
   const [autoVerifyMessage, setAutoVerifyMessage] = useState("");
   const [verifyPercent, setVerifyPercent] = useState(0);
-  const [verifyCurrentFile, setVerifyCurrentFile] = useState("");
+  const [verifyFileCounter, setVerifyFileCounter] = useState("");
   const [verifyPanelVisible, setVerifyPanelVisible] = useState(false);
   const [verifyPanelExiting, setVerifyPanelExiting] = useState(false);
   const verifyPanelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -183,9 +183,8 @@ export function SettingsScreen() {
           const d = event.payload;
           const pct = d.total_files > 0 ? (d.current_index / d.total_files) * 100 : 0;
           setVerifyPercent(pct);
-          setVerifyCurrentFile(d.current_file);
           if (d.total_files > 0) {
-            setAutoVerifyMessage(`${d.current_index} / ${d.total_files} files`);
+            setVerifyFileCounter(`${d.current_index} / ${d.total_files} files`);
           }
         });
         unlistenRef.current = unlisten;
@@ -223,7 +222,7 @@ export function SettingsScreen() {
     setAutoVerifyStatus("verifying");
     setAutoVerifyMessage("Scanning game files...");
     setVerifyPercent(0);
-    setVerifyCurrentFile("");
+    setVerifyFileCounter("");
     setAutoVerifying(true);
     try {
       const corrupted = await verifyGameFiles(cdnUrl, gamePath);
@@ -516,10 +515,13 @@ export function SettingsScreen() {
                       {autoVerifyMessage}
                     </p>
                   </div>
-                  <ProgressBar value={verifyPercent} variant="primary" size="sm" showPercent />
-                  {verifyCurrentFile && (
-                    <p className="text-[10px] text-muted truncate font-mono">{verifyCurrentFile}</p>
-                  )}
+                  <ProgressBar
+                    value={verifyPercent}
+                    variant="primary"
+                    size="sm"
+                    showPercent
+                    label={verifyFileCounter}
+                  />
                 </div>
               )}
               {autoVerifyStatus === "done" && (

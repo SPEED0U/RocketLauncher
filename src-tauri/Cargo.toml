@@ -1,6 +1,6 @@
 [package]
 name = "rocket-launcher"
-version = "1.5.0"
+version = "1.5.6"
 description = "Rocket Launcher for Need for Speed: World"
 authors = ["speedou"]
 license = "MIT"
@@ -51,4 +51,8 @@ windows-sys = { version = "0.52", features = [
     "Win32_Security",
     "Win32_System_Threading",
     "Win32_System_JobObjects",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_NetworkManagement_IpHelper",
 ] }
+image = { version = "0.25", default-features = false, features = ["webp", "ico"] }

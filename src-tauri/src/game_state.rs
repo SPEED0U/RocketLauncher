@@ -38,11 +38,17 @@ impl Default for GameState {
 }
 
 static GAME_STATE: Mutex<Option<GameState>> = Mutex::new(None);
+static GAME_RPC_ENABLED: Mutex<bool> = Mutex::new(true);
 
 pub fn set_server_name(name: &str) {
     let mut state = GAME_STATE.lock().unwrap();
     let s = state.get_or_insert_with(GameState::default);
     s.server_name = name.to_string();
+}
+
+pub fn set_rpc_enabled(enabled: bool) {
+    let mut lock = GAME_RPC_ENABLED.lock().unwrap();
+    *lock = enabled;
 }
 
 pub fn _reset() {
@@ -345,6 +351,11 @@ fn update_rpc(
     small_text: &str,
     small_image: &str,
 ) {
+    if !*GAME_RPC_ENABLED.lock().unwrap() {
+        eprintln!("[GAME_STATE] RPC disabled for this server category, skipping update");
+        return;
+    }
+
     let large_text = if !persona_name.is_empty() {
         format!("{} - Level: {}", persona_name, persona_level)
     } else {

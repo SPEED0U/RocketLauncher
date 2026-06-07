@@ -5,7 +5,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useLauncherStore } from "@/stores/launcherStore";
 import { getSystemInfo, getHwidInfo } from "@/lib/tauri-api";
-import { APP_VERSION, getAppVersion } from "@/lib/config";
+import { APP_VERSION, getDisplayAppVersion } from "@/lib/config";
 import { Copy, Check, Monitor, Settings2, Server, Cpu, Fingerprint } from "lucide-react";
 import { Button } from "@/components/ui/Button";
 import type { SystemInfo } from "@/lib/tauri-api";
@@ -64,7 +64,7 @@ export function DebugScreen() {
     getHwidInfo()
       .then(([h, hh]) => { setHwid(h); setHiddenHwid(hh); })
       .catch(() => { setHwid("N/A"); setHiddenHwid("N/A"); });
-    getAppVersion().then(setVersion).catch(() => setVersion(APP_VERSION));
+    getDisplayAppVersion().then(setVersion).catch(() => setVersion(APP_VERSION));
   }, []);
 
   const fmtBytes = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GB`;

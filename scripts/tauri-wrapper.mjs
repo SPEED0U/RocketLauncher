@@ -42,34 +42,75 @@ async function askVersion() {
   });
 
   return new Promise((resolve) => {
-    rl.question('Enter version number (e.g., 1.0.0): ', (version) => {
+    rl.question('Enter version number (e.g., 1.0.0 or 1.0.0b): ', (version) => {
       rl.close();
       resolve(version.trim());
     });
   });
 }
 
+function isBetaVersion(version) {
+  return version.endsWith('b');
+}
+
+function manifestVersion(version) {
+  return isBetaVersion(version) ? `${version.slice(0, -1)}-beta.0` : version;
+}
+
+function versionAliases(version) {
+  const aliases = [version, manifestVersion(version)];
+  return Array.from(new Set(aliases.filter(Boolean)));
+}
+
+function isMatchingArtifact(fileName, version, extensions) {
+  if (!extensions.some(ext => fileName.endsWith(ext))) {
+    return false;
+  }
+
+  const beta = isBetaVersion(version);
+  const rawVersion = version;
+  const semverVersion = manifestVersion(version);
+
+  if (beta) {
+    return fileName.includes(rawVersion) || fileName.includes(semverVersion);
+  }
+
+  if (!fileName.includes(rawVersion)) {
+    return false;
+  }
+
+  // Prevent a stable release like 1.5.2 from picking stale beta artifacts such
+  // as 1.5.2b or 1.5.2-beta.0 left in the bundle directory.
+  return !fileName.includes(`${rawVersion}b`) && !fileName.includes(`${rawVersion}-beta.`);
+}
+
+function publicArtifactName(fileName, version) {
+  if (!isBetaVersion(version)) return fileName;
+  return fileName.replace(manifestVersion(version), version);
+}
+
 function updateVersion(version) {
   console.log(`\nUpdating version to ${version}...\n`);
+  const cargoVersion = manifestVersion(version);
 
   // Update tauri.conf.json
   const tauriConfPath = join(tauriDir, 'tauri.conf.json');
   const tauriConf = JSON.parse(readFileSync(tauriConfPath, 'utf8'));
-  tauriConf.version = version;
+  tauriConf.version = cargoVersion;
   writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2) + '\n', 'utf8');
   console.log('Updated tauri.conf.json');
 
   // Update Cargo.toml
   const cargoTomlPath = join(tauriDir, 'Cargo.toml');
   let cargoToml = readFileSync(cargoTomlPath, 'utf8');
-  cargoToml = cargoToml.replace(/^version = "[^"]+"/m, `version = "${version}"`);
+  cargoToml = cargoToml.replace(/^version = "[^"]+"/m, `version = "${cargoVersion}"`);
   writeFileSync(cargoTomlPath, cargoToml, 'utf8');
   console.log('Updated Cargo.toml');
 
   // Update package.json
   const packageJsonPath = join(rootDir, 'package.json');
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
-  packageJson.version = version;
+  packageJson.version = cargoVersion;
   writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n', 'utf8');
   console.log('Updated package.json');
   
@@ -89,14 +130,19 @@ function updateVersion(version) {
 }
 
 // Windows build (on host)
-function runWindowsBuild(extraArgs = []) {
+function runWindowsBuild(version, extraArgs = []) {
   return new Promise((resolve, reject) => {
     console.log('\n[Windows] Building Tauri app...\n');
     const cmd = ['npx', 'tauri', 'build', ...extraArgs].join(' ');
     const proc = spawn(cmd, [], {
       cwd: rootDir,
       shell: true,
-      stdio: 'inherit'
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        ROCKET_LAUNCHER_VERSION: version,
+        ROCKET_LAUNCHER_CHANNEL: isBetaVersion(version) ? 'beta' : 'stable'
+      }
     });
     proc.on('close', (code) => {
       if (code !== 0) reject(new Error(`Windows build failed with code ${code}`));
@@ -121,6 +167,7 @@ function runLinuxBuild(version, extraArgs = []) {
   return new Promise((resolve, reject) => {
     console.log('\n[Linux] Building Tauri app via WSL...\n');
     const wslPath = windowsPathToWsl(rootDir);
+    const betaChannel = isBetaVersion(version) ? 'beta' : 'stable';
 
     // Write the bash script to a file to avoid all template/escaping issues
     const scriptPath = join(rootDir, 'scripts', '_linux-build.sh');
@@ -161,6 +208,8 @@ function runLinuxBuild(version, extraArgs = []) {
       '',
       '# Use a native Linux target dir to avoid GLIBC mismatch with Windows-compiled build scripts',
       'export CARGO_TARGET_DIR="/tmp/rocket-launcher-target"',
+      `export ROCKET_LAUNCHER_VERSION="${version}"`,
+      `export ROCKET_LAUNCHER_CHANNEL="${betaChannel}"`,
       'mkdir -p "$CARGO_TARGET_DIR"',
       '',
       '# Skip beforeBuildCommand: out/ already built by Windows step, NTFS write fails from WSL',
@@ -262,10 +311,9 @@ function findExeFile(bundleDir, version) {
   }
 
   const files = readdirSync(nsisDir);
-  // Prefer exe matching the current version, fallback to any setup exe
-  const exeFile =
-    files.find(f => f.endsWith('.exe') && !f.includes('uninstall') && f.includes(version)) ||
-    files.find(f => f.endsWith('.exe') && !f.includes('uninstall'));
+  const exeFile = files.find(
+    f => !f.includes('uninstall') && isMatchingArtifact(f, version, ['.exe'])
+  );
 
   if (!exeFile) {
     throw new Error('Setup .exe file not found in NSIS output');
@@ -280,38 +328,34 @@ function findLinuxArtifacts(bundleDir, version) {
   const appimageDir = join(bundleDir, 'appimage');
   if (existsSync(appimageDir)) {
     const files = readdirSync(appimageDir);
-    const f =
-      files.find(f => f.endsWith('.AppImage') && f.includes(version)) ||
-      files.find(f => f.endsWith('.AppImage'));
+    const f = files.find(f => isMatchingArtifact(f, version, ['.AppImage']));
     if (f) result.appimage = join(appimageDir, f);
   }
 
   const debDir = join(bundleDir, 'deb');
   if (existsSync(debDir)) {
     const files = readdirSync(debDir);
-    const f =
-      files.find(f => f.endsWith('.deb') && f.includes(version)) ||
-      files.find(f => f.endsWith('.deb'));
+    const f = files.find(f => isMatchingArtifact(f, version, ['.deb']));
     if (f) result.deb = join(debDir, f);
   }
 
   return result;
 }
 
-function createLatestJson(version, winExePath, linuxArtifacts) {
+function createReleaseJson(version, winExePath, linuxArtifacts) {
   const platforms = {};
 
   if (winExePath) {
-    platforms.windows = { exe: basename(winExePath) };
+    platforms.windows = { exe: publicArtifactName(basename(winExePath), version) };
   }
 
   if (linuxArtifacts?.appimage || linuxArtifacts?.deb) {
     platforms.linux = {};
-    if (linuxArtifacts.appimage) platforms.linux.appimage = basename(linuxArtifacts.appimage);
-    if (linuxArtifacts.deb) platforms.linux.deb = basename(linuxArtifacts.deb);
+    if (linuxArtifacts.appimage) platforms.linux.appimage = publicArtifactName(basename(linuxArtifacts.appimage), version);
+    if (linuxArtifacts.deb) platforms.linux.deb = publicArtifactName(basename(linuxArtifacts.deb), version);
   }
 
-  const latestData = {
+  const releaseData = {
     version,
     publishDate: new Date().toISOString(),
     productName: "RocketLauncher",
@@ -324,31 +368,32 @@ function createLatestJson(version, winExePath, linuxArtifacts) {
 
   // Copy Windows artifact
   if (winExePath) {
-    const dest = join(distDir, basename(winExePath));
+    const dest = join(distDir, publicArtifactName(basename(winExePath), version));
     copyFileSync(winExePath, dest);
-    console.log(`Copied ${basename(winExePath)} → dist/${version}/`);
+    console.log(`Copied ${basename(dest)} → dist/${version}/`);
   }
 
   // Copy Linux artifacts
   if (linuxArtifacts?.appimage) {
-    const dest = join(distDir, basename(linuxArtifacts.appimage));
+    const dest = join(distDir, publicArtifactName(basename(linuxArtifacts.appimage), version));
     copyFileSync(linuxArtifacts.appimage, dest);
-    console.log(`Copied ${basename(linuxArtifacts.appimage)} → dist/${version}/`);
+    console.log(`Copied ${basename(dest)} → dist/${version}/`);
   }
   if (linuxArtifacts?.deb) {
-    const dest = join(distDir, basename(linuxArtifacts.deb));
+    const dest = join(distDir, publicArtifactName(basename(linuxArtifacts.deb), version));
     copyFileSync(linuxArtifacts.deb, dest);
-    console.log(`Copied ${basename(linuxArtifacts.deb)} → dist/${version}/`);
+    console.log(`Copied ${basename(dest)} → dist/${version}/`);
   }
 
-  const latestJsonPath = join(distDir, 'latest.json');
-  writeFileSync(latestJsonPath, JSON.stringify(latestData, null, 2) + '\n', 'utf8');
+  const jsonName = isBetaVersion(version) ? 'beta.json' : 'latest.json';
+  const releaseJsonPath = join(distDir, jsonName);
+  writeFileSync(releaseJsonPath, JSON.stringify(releaseData, null, 2) + '\n', 'utf8');
 
-  console.log('\nCreated latest.json:');
-  console.log(JSON.stringify(latestData, null, 2));
+  console.log(`\nCreated ${jsonName}:`);
+  console.log(JSON.stringify(releaseData, null, 2));
   console.log(`\nAll artifacts in: dist/${version}/\n`);
 
-  return latestJsonPath;
+  return releaseJsonPath;
 }
 
 async function main() {
@@ -382,8 +427,8 @@ async function main() {
       console.log('Building FINAL release\n');
       version = await askVersion();
       
-      if (!version || !/^\d+\.\d+\.\d+/.test(version)) {
-        console.error('Invalid version format. Expected: x.y.z');
+      if (!version || !/^\d+\.\d+\.\d+b?$/.test(version)) {
+        console.error('Invalid version format. Expected: x.y.z or x.y.zb');
         process.exit(1);
       }
 
@@ -393,7 +438,7 @@ async function main() {
       cleanStaleTauriContextArtifacts();
 
       // --- Windows build ---
-      await runWindowsBuild(tauriArgs);
+      await runWindowsBuild(version, tauriArgs);
       // --- Linux build via WSL ---
       if (isWslAvailable()) {
         try {
@@ -419,7 +464,7 @@ async function main() {
 
       const linuxArtifacts = findLinuxArtifacts(bundleDir, version);
 
-      createLatestJson(version, winExePath, linuxArtifacts);
+      createReleaseJson(version, winExePath, linuxArtifacts);
 
       console.log('Final release build complete!\n');
     } else {
@@ -429,7 +474,7 @@ async function main() {
       console.log(`Building version ${version}...\n`);
 
       // Run build with remaining args
-      await runWindowsBuild(tauriArgs);
+      await runWindowsBuild(version, tauriArgs);
 
       console.log('\nBuild complete!\n');
     }

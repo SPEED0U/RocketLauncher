@@ -13,6 +13,7 @@ import type { LauncherPage } from "@/lib/types";
 import { useEffect, useState } from "react";
 import { UpdateNotification } from "@/components/ui/UpdateNotification";
 import { Tooltip } from "@/components/ui/Tooltip";
+import { getDisplayAppVersion } from "@/lib/config";
 
 interface NavAction {
   page: LauncherPage;
@@ -72,8 +73,7 @@ export function TopBar() {
   }, []);
 
   useEffect(() => {
-    import("@tauri-apps/api/app")
-      .then(({ getVersion }) => getVersion())
+    getDisplayAppVersion()
       .then(setAppVersion)
       .catch(() => setAppVersion("Loading..."));
   }, []);
@@ -96,7 +96,7 @@ export function TopBar() {
       onMouseDown={startDrag}
       className="h-12 shrink-0 bg-surface/60 border-b border-border/50 flex items-center justify-between px-4 backdrop-blur-sm z-10 select-none"
     >
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 -ml-1">
         <button
           onClick={() => !navLocked && currentPage !== "main" && setPage("main")}
           disabled={navLocked || currentPage === "main"}
@@ -116,7 +116,7 @@ export function TopBar() {
           </div>
         </button>
       </div>
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-1">
         <div
           className="overflow-hidden transition-all duration-300 ease-in-out"
           style={{

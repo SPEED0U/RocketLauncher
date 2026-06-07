@@ -11,7 +11,7 @@ import { useServerStore } from "@/stores/serverStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useCredentialsStore } from "@/stores/credentialsStore";
 import { usePlaytimeStore } from "@/stores/playtimeStore";
-import { Play, LogOut, Download, UserPlus } from "lucide-react";
+import { Play, LogOut, Download, UserPlus, Loader2, Gamepad2, LogIn, FolderOpen } from "lucide-react";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { validateEmail, maskEmail } from "@/lib/utils";
 import { open } from "@tauri-apps/plugin-shell";
@@ -61,11 +61,17 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
   const { visible: errorVisible, displayed: displayedError } = useAlert(error);
   const { visible: infoVisible, displayed: displayedInfo } = useAlert(info);
 
-  const { isLoggedIn, isGameRunning, gameStatus, isAutoVerifying, setAuth, setPage, setGameRunning, setGameStatus, setDownloadProgress, logout } = useLauncherStore();
+  const { isLoggedIn, isGameRunning, gameStatus, isAutoVerifying, downloadProgress, setAuth, setPage, setGameRunning, setGameStatus, setDownloadProgress, logout } = useLauncherStore();
   const { selectedServer, selectedServerDetails } = useServerStore();
   const { settings, setSettings } = useSettingsStore();
   const { saveCredentials, getCredentials } = useCredentialsStore();
   const { addSeconds } = usePlaytimeStore();
+  const isLaunching = gameStatus === "launching";
+  const isBusyDownloadingMods =
+    downloadProgress.status === "downloading" ||
+    downloadProgress.status === "extracting" ||
+    downloadProgress.status === "verifying";
+  const isActionLocked = isLaunching || isGameRunning || isBusyDownloadingMods || isAutoVerifying;
 
   useEffect(() => {
     if (!displayedServerId) return;
@@ -148,11 +154,15 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
   }
 
   async function handlePlay() {
+    if (isActionLocked) return;
     if (!selectedServer || !settings.installationDirectory) return;
     try {
       setDownloadProgress({ status: "verifying", fileName: "Preparing..." });
       await cleanMods(settings.installationDirectory).catch(() => {});
-      await grantFolderPermissions(settings.installationDirectory).catch(() => {});
+      if (settings.permissionsGrantedFor !== settings.installationDirectory) {
+        await grantFolderPermissions(settings.installationDirectory).catch(() => {});
+        setSettings({ permissionsGrantedFor: settings.installationDirectory });
+      }
 
       const modInfo = await fetchModInfo(selectedServer.ip).catch(() => null);
       if (modInfo?.base_path && modInfo?.server_id) {
@@ -174,18 +184,9 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
       setGameStatus("launching");
 
       const discordAppId = selectedServerDetails?.discordApplicationID || selectedServer.discordAppId;
-      await launchGame(
-        settings.installationDirectory,
-        selectedServer.id,
-        selectedServer.name,
-        selectedServer.ip,
-        tok,
-        uid,
-        discordAppId,
-        settings.closeOnGameExit,
-        settings.disableProxy
-      );
 
+      // Register the listener BEFORE launching the game to avoid a race
+      // condition where the game fires GetPermanentSession before we listen.
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => {
           unlisten.then(fn => fn());
@@ -196,6 +197,23 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
           clearTimeout(timeout);
           unlisten.then(fn => fn());
           resolve();
+        });
+
+        launchGame(
+          settings.installationDirectory,
+          selectedServer.id,
+          selectedServer.name,
+          selectedServer.ip,
+          tok,
+          uid,
+          discordAppId,
+          settings.closeOnGameExit,
+          settings.disableProxy,
+          selectedServer.category
+        ).catch((err) => {
+          clearTimeout(timeout);
+          unlisten.then(fn => fn());
+          reject(err);
         });
       });
 
@@ -336,13 +354,19 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
           <>
             <Button
               type="button"
-              disabled={isGameRunning || isAutoVerifying || !settings.installationDirectory || needsGameFiles}
-              className="flex-1 bg-amber-500 hover:bg-amber-400 text-white animate-soft-pulse font-black tracking-widest uppercase glow-accent"
+              disabled={isActionLocked || !settings.installationDirectory || needsGameFiles}
+              className="flex-1 bg-amber-500 hover:bg-amber-400 text-white animate-soft-pulse font-black tracking-widest"
               onClick={handlePlay}
             >
-              <Play size={16} className="mr-2" />
+              {gameStatus === "launching" ? (
+                <Loader2 size={16} className="mr-2 animate-spin" />
+              ) : gameStatus === "running" ? (
+                <Gamepad2 size={16} className="mr-2" />
+              ) : (
+                <Play size={16} className="mr-2" />
+              )}
               <span key={gameStatus} className="animate-fade-in">
-                {gameStatus === "launching" ? "LAUNCHING..." : gameStatus === "running" ? "GAME RUNNING" : "PLAY"}
+                {gameStatus === "launching" ? "Launching..." : gameStatus === "running" ? "Game running" : "Play"}
               </span>
             </Button>
           </>
@@ -361,7 +385,8 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
               }
             }}
           >
-            Select Directory
+            <FolderOpen size={16} className="mr-2" />
+            Select directory
           </Button>
         ) : needsGameFiles ? (
           <Button
@@ -370,9 +395,13 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
             className="flex-1 bg-amber-500 hover:bg-amber-400 text-white animate-soft-pulse"
             onClick={onDownloadGame}
           >
-            <Download size={16} className="mr-2" />
+            {isDownloading ? (
+              <Loader2 size={16} className="mr-2 animate-spin" />
+            ) : (
+              <Download size={16} className="mr-2" />
+            )}
             <span key={isDownloading ? "dl" : "idle"} className="animate-fade-in">
-              {isDownloading ? "Downloading..." : "Download Game"}
+              {isDownloading ? "Downloading..." : "Download game"}
             </span>
           </Button>
         ) : (
@@ -382,7 +411,8 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
             disabled={!selectedServer || isAutoVerifying}
             className="flex-1"
           >
-            SIGN IN
+            <LogIn size={16} className="mr-2" />
+            Sign in
           </Button>
         )}
         <Tooltip label={isLoggedIn ? "Sign out" : "Register"}>
@@ -390,7 +420,7 @@ export function LoginForm({ needsGameFiles, isDownloading, onDownloadGame, canDo
             type="button"
             variant="ghost"
             className={`self-stretch px-3 transition-colors duration-200 ${isLoggedIn ? "text-muted hover:text-danger hover:bg-danger/10 disabled:opacity-30 disabled:pointer-events-none" : "text-muted-foreground hover:text-foreground hover:bg-surface-hover"}`}
-            disabled={isLoggedIn ? isGameRunning : false}
+            disabled={isLoggedIn ? isActionLocked : false}
             onClick={isLoggedIn ? logout : () => {
               const url = selectedServerDetails?.webSignupUrl?.trim();
               if (url) {

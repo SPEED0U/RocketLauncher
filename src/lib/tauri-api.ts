@@ -283,7 +283,11 @@ export async function recoverPassword(
 }
 
 export async function pingServer(serverIp: string): Promise<number> {
-  return invoke<number>("ping_server", { serverIp });
+  return invoke<number>("measure_server_information_latency", { serverIp });
+}
+
+export async function measureServerInformationLatency(serverIp: string): Promise<number> {
+  return invoke<number>("measure_server_information_latency", { serverIp });
 }
 
 export async function launchGame(
@@ -295,7 +299,8 @@ export async function launchGame(
   userId: string,
   discordAppId?: string,
   closeOnExit?: boolean,
-  disableProxy?: boolean
+  disableProxy?: boolean,
+  serverCategory?: string
 ): Promise<void> {
   const params = {
     gamePath,
@@ -307,6 +312,7 @@ export async function launchGame(
     discordAppId: discordAppId || null,
     closeOnExit: closeOnExit ?? false,
     disableProxy: disableProxy ?? false,
+    serverCategory: serverCategory || null,
   };
   return invoke("launch_game", params);
 }

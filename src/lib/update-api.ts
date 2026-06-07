@@ -7,8 +7,8 @@ export interface UpdateInfo {
   productName: string;
 }
 
-export async function checkForUpdates(): Promise<UpdateInfo | null> {
-  return invoke<UpdateInfo | null>("check_for_updates");
+export async function checkForUpdates(betaMode?: boolean): Promise<UpdateInfo | null> {
+  return invoke<UpdateInfo | null>(betaMode ? "check_for_beta_updates" : "check_for_updates");
 }
 
 export async function downloadUpdate(exeName: string): Promise<string> {
