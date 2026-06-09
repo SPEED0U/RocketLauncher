@@ -6,11 +6,11 @@ use sha1::Sha1;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, command};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
@@ -1608,6 +1608,62 @@ fn normalize_entry_name(name: &str) -> String {
     { name.to_owned() }
 }
 
+fn scripts_snapshot_key(game_dir: &Path) -> String {
+    #[cfg(windows)]
+    {
+        game_dir
+            .to_string_lossy()
+            .replace('/', "\\")
+            .to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        game_dir.to_string_lossy().to_string()
+    }
+}
+
+fn scripts_snapshot_store() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn snapshot_scripts_baseline(game_dir: &Path) -> Result<(), String> {
+    let scripts_dir = game_dir.join("scripts");
+    let known_before: HashSet<String> = if scripts_dir.exists() {
+        std::fs::read_dir(&scripts_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let key = scripts_snapshot_key(game_dir);
+    let mut store = scripts_snapshot_store()
+        .lock()
+        .map_err(|e| format!("scripts snapshot lock poisoned: {}", e))?;
+    store.insert(key, known_before);
+    Ok(())
+}
+
+fn get_scripts_baseline(game_dir: &Path) -> Option<HashSet<String>> {
+    let key = scripts_snapshot_key(game_dir);
+    scripts_snapshot_store()
+        .lock()
+        .ok()
+        .and_then(|store| store.get(&key).cloned())
+}
+
+fn clear_scripts_baseline(game_dir: &Path) {
+    if let Ok(mut store) = scripts_snapshot_store().lock() {
+        let key = scripts_snapshot_key(game_dir);
+        store.remove(&key);
+    }
+}
+
 fn sha1_hex_file(path: &Path) -> Result<String, String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hasher = Sha1::new();
@@ -1725,10 +1781,9 @@ pub fn has_pending_mod_cleanup(game_path: String) -> Result<bool, String> {
 
     let modules_dir = game_dir.join("modules");
     let links_file = game_dir.join(".links");
-    let snapshot_path = game_dir.join(".scripts_snapshot");
     let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
 
-    if links_file.exists() || modules_dir.exists() || snapshot_path.exists() {
+    if links_file.exists() || modules_dir.exists() {
         return Ok(true);
     }
 
@@ -2318,37 +2373,34 @@ fn clean_mods_internal(game_dir: &Path) -> Result<bool, String> {
     }
 
     // scripts/ may contain files placed by the user — only remove files that
-    // were added during this mod session (i.e. not present in the pre-launch snapshot).
+    // were added during this mod session (i.e. not present in the pre-launch baseline
+    // captured in memory at launch time).
+    // IMPORTANT: if no baseline exists, do NOT touch scripts at all.
     let scripts_dir = game_dir.join("scripts");
-    let snapshot_path = game_dir.join(".scripts_snapshot");
     if scripts_dir.exists() {
-        let known_before: std::collections::HashSet<String> = std::fs::read_to_string(&snapshot_path)
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect();
-        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if !p.is_file() { continue; }
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                if !known_before.contains(&name) {
-                    std::fs::remove_file(&p).ok();
+        if let Some(known_before) = get_scripts_baseline(game_dir) {
+            if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if !p.is_file() { continue; }
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    if !known_before.contains(&name) {
+                        std::fs::remove_file(&p).ok();
+                    }
                 }
             }
         }
-    } else {
-        std::fs::create_dir_all(&scripts_dir).ok();
     }
-    std::fs::remove_file(&snapshot_path).ok();
 
     let artifacts = ["lightfx.dll", "ModManager.dat", "PocoFoundation.dll"];
     let still_pending = links_file.exists()
         || modules_dir.exists()
-        || snapshot_path.exists()
         || artifacts.iter().any(|artifact| game_dir.join(artifact).exists())
         ;
+
+    if !still_pending {
+        clear_scripts_baseline(game_dir);
+    }
 
     Ok(still_pending)
 }

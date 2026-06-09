@@ -3892,7 +3892,7 @@ dependencies = [
 
 [[package]]
 name = "rocket-launcher"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "base64 0.22.1",
  "discord-rich-presence",

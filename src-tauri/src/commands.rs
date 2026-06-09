@@ -702,24 +702,12 @@ pub async fn launch_game(
     CANCEL_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Snapshot the current contents of scripts/ before the game (and its mod
-    // manager) can add new files — so clean_mods knows which files to keep.
+    // manager) can add new files — kept in launcher memory for this session
+    // so clean_mods knows which files to keep.
     {
         let game_dir_for_snapshot = game_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let scripts_dir = game_dir_for_snapshot.join("scripts");
-            let snapshot_path = game_dir_for_snapshot.join(".scripts_snapshot");
-            let existing: Vec<String> = if scripts_dir.exists() {
-                std::fs::read_dir(&scripts_dir)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .filter(|e| e.path().is_file())
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            std::fs::write(&snapshot_path, existing.join("\n")).ok();
+            let _ = crate::downloader::snapshot_scripts_baseline(&game_dir_for_snapshot);
         })
         .await
         .map_err(|e| format!("Failed to snapshot scripts directory: {}", e))?;
